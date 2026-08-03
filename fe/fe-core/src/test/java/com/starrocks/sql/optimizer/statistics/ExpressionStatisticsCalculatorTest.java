@@ -173,6 +173,12 @@ public class ExpressionStatisticsCalculatorTest {
         Assertions.assertEquals(1000, columnStatistic.getDistinctValuesCount(), 0.001);
         Assertions.assertEquals(0, columnStatistic.getNullsFraction(), 0.001);
 
+        // With partition-aware estimate: rows / num_partitions
+        columnStatistic = ExpressionStatisticCalculator.calculate(rowNumberCall, statisticsWithKnownCols, 1000, 100);
+        Assertions.assertEquals(1, columnStatistic.getMinValue(), 0.001);
+        Assertions.assertEquals(100, columnStatistic.getMaxValue(), 0.001);
+        Assertions.assertEquals(100, columnStatistic.getDistinctValuesCount(), 0.001);
+
         // When all input column stats are unknown, non-nullary calls hit deriveBasicColStats.
         // ROW_NUMBER() must bypass that guard (nullary-first) because it only needs row count.
         Statistics statisticsWithUnknownCols = Statistics.builder()

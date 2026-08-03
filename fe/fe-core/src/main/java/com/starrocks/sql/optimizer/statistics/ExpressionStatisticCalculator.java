@@ -74,11 +74,20 @@ public class ExpressionStatisticCalculator {
     }
 
     public static ColumnStatistic calculate(ScalarOperator operator, Statistics input, double rowCount) {
+        return calculate(operator, input, rowCount, rowCount);
+    }
+
+    public static ColumnStatistic calculate(ScalarOperator operator, Statistics input, double rowCount,
+                                            double avgRowsPerPartition) {
         if (Double.isNaN(rowCount)) {
             LOG.debug("found a NaN row count when calculating column statistic for expr: {}", operator);
             return ColumnStatistic.unknown();
         }
-        return operator.accept(new ExpressionStatisticVisitor(input, rowCount), null);
+        if (Double.isNaN(avgRowsPerPartition)) {
+            LOG.debug("found a NaN average row count when calculating column statistic for expr: {}", operator);
+            return ColumnStatistic.unknown();
+        }
+        return operator.accept(new ExpressionStatisticVisitor(input, rowCount, avgRowsPerPartition), null);
     }
 
     private record NullableBooleanProbabilities(double pTrue, double pFalse, double pNull) {
@@ -88,13 +97,15 @@ public class ExpressionStatisticCalculator {
         private final Statistics inputStatistics;
         // Some functions estimate need plan node row count, such as COUNT
         private final double rowCount;
+        private final double avgRowsPerPartition;
 
         // Stats for lambda variables.
         private final Map<ColumnRefOperator, ColumnStatistic> mappedStats = new HashMap<>();
 
-        public ExpressionStatisticVisitor(Statistics statistics, double rowCount) {
+        public ExpressionStatisticVisitor(Statistics statistics, double rowCount, double avgRowsPerPartition) {
             this.inputStatistics = statistics;
             this.rowCount = Math.max(1.0, rowCount);
+            this.avgRowsPerPartition = Math.max(1.0, avgRowsPerPartition);
         }
 
         @Override
@@ -552,11 +563,10 @@ public class ExpressionStatisticCalculator {
                     minValue = 0;
                     maxValue = inputStatistics.getOutputRowCount();
                     break;
-                //(TODO v.kurapati: implement the more complicated case with checking for window functions)
                 case FunctionSet.ROW_NUMBER:
                     minValue = 1;
-                    maxValue = inputStatistics.getOutputRowCount();
-                    distinctValue = inputStatistics.getOutputRowCount();
+                    maxValue = avgRowsPerPartition;
+                    distinctValue = avgRowsPerPartition;
                     break;
                 case FunctionSet.RAND:
                 case FunctionSet.RANDOM:
