@@ -174,7 +174,8 @@ public class ExpressionStatisticsCalculatorTest {
         Assertions.assertEquals(0, columnStatistic.getNullsFraction(), 0.001);
 
         // With partition-aware estimate: rows / num_partitions
-        columnStatistic = ExpressionStatisticCalculator.calculate(rowNumberCall, statisticsWithKnownCols, 1000, 100);
+        Statistics statisticsWithPartition = statisticsWithKnownCols.withAvgRowsPerPartition(100);
+        columnStatistic = ExpressionStatisticCalculator.calculate(rowNumberCall, statisticsWithPartition);
         Assertions.assertEquals(1, columnStatistic.getMinValue(), 0.001);
         Assertions.assertEquals(100, columnStatistic.getMaxValue(), 0.001);
         Assertions.assertEquals(100, columnStatistic.getDistinctValuesCount(), 0.001);

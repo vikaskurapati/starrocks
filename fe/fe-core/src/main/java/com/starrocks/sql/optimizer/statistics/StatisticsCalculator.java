@@ -25,7 +25,6 @@ import com.google.common.collect.Sets;
 import com.starrocks.catalog.BenchmarkTable;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.FileTable;
-import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.ListPartitionInfo;
 import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.OlapTable;
@@ -2180,15 +2179,10 @@ public class StatisticsCalculator extends OperatorVisitor<Void, ExpressionContex
         builder.addColumnStatistics(inputStatistics.getColumnStatistics());
 
         double inputRowCount = inputStatistics.getOutputRowCount();
-        double avgRowsPerPartition = estimateAvgRowsPerPartition(inputStatistics, partitionExpressions);
-        analyticCall.forEach((key, value) -> {
-            if (FunctionSet.ROW_NUMBER.equals(value.getFnName())) {
-                builder.addColumnStatistic(key, ExpressionStatisticCalculator.calculate(value, inputStatistics,
-                        inputRowCount, avgRowsPerPartition));
-            } else {
-                builder.addColumnStatistic(key, ExpressionStatisticCalculator.calculate(value, inputStatistics));
-            }
-        });
+        Statistics windowInputStatistics =
+                inputStatistics.withAvgRowsPerPartition(estimateAvgRowsPerPartition(inputStatistics, partitionExpressions));
+        analyticCall.forEach((key, value) -> builder.addColumnStatistic(key,
+                ExpressionStatisticCalculator.calculate(value, windowInputStatistics)));
 
         builder.setOutputRowCount(inputRowCount);
 

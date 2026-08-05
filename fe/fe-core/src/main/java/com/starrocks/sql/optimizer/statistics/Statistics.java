@@ -27,6 +27,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalDouble;
 import java.util.Set;
 
 import static java.lang.Double.NaN;
@@ -48,6 +49,7 @@ public class Statistics {
     private final StatsSource statsSource;
 
     private final Map<Set<ColumnRefOperator>, MultiColumnCombinedStats> multiColumnCombinedStats;
+    private final OptionalDouble avgRowsPerPartition;
 
     private static double clampOutputRowCount(double outputRowCount) {
         // Due to the influence of the default filter coefficient,
@@ -67,6 +69,7 @@ public class Statistics {
         this.shadowColumns = Collections.unmodifiableCollection(builder.shadowColumns);
         this.statsSource = builder.statsSource;
         this.multiColumnCombinedStats = Collections.unmodifiableMap(builder.multiColumnCombinedStats);
+        this.avgRowsPerPartition = builder.avgRowsPerPartition;
     }
 
     private Statistics(double outputRowCount,
@@ -74,13 +77,15 @@ public class Statistics {
                        boolean tableRowCountMayInaccurate,
                        Collection<ColumnRefOperator> shadowColumns,
                        StatsSource statsSource,
-                       Map<Set<ColumnRefOperator>, MultiColumnCombinedStats> multiColumnCombinedStats) {
+                       Map<Set<ColumnRefOperator>, MultiColumnCombinedStats> multiColumnCombinedStats,
+                       OptionalDouble avgRowsPerPartition) {
         this.outputRowCount = outputRowCount;
         this.columnStatistics = Collections.unmodifiableMap(columnStatistics);
         this.tableRowCountMayInaccurate = tableRowCountMayInaccurate;
         this.shadowColumns = Collections.unmodifiableCollection(shadowColumns);
         this.statsSource = statsSource;
         this.multiColumnCombinedStats = Collections.unmodifiableMap(multiColumnCombinedStats);
+        this.avgRowsPerPartition = avgRowsPerPartition;
     }
 
     public double getOutputRowCount() {
@@ -93,7 +98,19 @@ public class Statistics {
             return this;
         }
         return new Statistics(clamped, columnStatistics, tableRowCountMayInaccurate, shadowColumns, statsSource,
-                multiColumnCombinedStats);
+                multiColumnCombinedStats, avgRowsPerPartition);
+    }
+
+    public OptionalDouble getAvgRowsPerPartition() {
+        return avgRowsPerPartition;
+    }
+
+    public Statistics withAvgRowsPerPartition(double newAvgRowsPerPartition) {
+        OptionalDouble clamped = OptionalDouble.of(Math.max(1.0, newAvgRowsPerPartition));
+        if (avgRowsPerPartition.equals(clamped)) {
+            return this;
+        }
+        return buildFrom(this).setAvgRowsPerPartition(newAvgRowsPerPartition).build();
     }
 
     public double getOutputSize(ColumnRefSet outputColumns) {
@@ -242,7 +259,8 @@ public class Statistics {
                 other.tableRowCountMayInaccurate,
                 other.shadowColumns,
                 other.statsSource,
-                other.multiColumnCombinedStats);
+                other.multiColumnCombinedStats,
+                other.avgRowsPerPartition);
     }
 
     public static Builder builder() {
@@ -258,6 +276,7 @@ public class Statistics {
         private Collection<ColumnRefOperator> shadowColumns;
         private StatsSource statsSource = StatsSource.NONE;
         private final Map<Set<ColumnRefOperator>, MultiColumnCombinedStats> multiColumnCombinedStats;
+        private OptionalDouble avgRowsPerPartition = OptionalDouble.empty();
 
 
         public Builder() {
@@ -267,7 +286,8 @@ public class Statistics {
         private Builder(double outputRowCount, Map<ColumnRefOperator, ColumnStatistic> columnStatistics,
                         boolean tableRowCountMayInaccurate, Collection<ColumnRefOperator> shadowColumns,
                         StatsSource statsSource,
-                        Map<Set<ColumnRefOperator>, MultiColumnCombinedStats> multiColumnCombinedStats) {
+                        Map<Set<ColumnRefOperator>, MultiColumnCombinedStats> multiColumnCombinedStats,
+                        OptionalDouble avgRowsPerPartition) {
             this.outputRowCount = outputRowCount;
             this.columnStatistics = new HashMap<>(columnStatistics);
             this.tableRowCountMayInaccurate = tableRowCountMayInaccurate;
@@ -275,12 +295,13 @@ public class Statistics {
             this.statsSource = statsSource;
             this.multiColumnCombinedStats = (multiColumnCombinedStats == null || multiColumnCombinedStats.isEmpty()) ?
                     new HashMap<>() : new HashMap<>(multiColumnCombinedStats);
+            this.avgRowsPerPartition = avgRowsPerPartition;
         }
 
         private Builder(double outputRowCount, Map<ColumnRefOperator, ColumnStatistic> columnStatistics,
                         boolean tableRowCountMayInaccurate) {
             this(outputRowCount, columnStatistics, tableRowCountMayInaccurate, Lists.newArrayList(),
-                    StatsSource.NONE, new HashMap<>());
+                    StatsSource.NONE, new HashMap<>(), OptionalDouble.empty());
         }
 
         public Builder setOutputRowCount(double outputRowCount) {
@@ -342,6 +363,11 @@ public class Statistics {
 
         public Builder setStatsSource(StatsSource statsSource) {
             this.statsSource = statsSource;
+            return this;
+        }
+
+        public Builder setAvgRowsPerPartition(double avgRowsPerPartition) {
+            this.avgRowsPerPartition = OptionalDouble.of(Math.max(1.0, avgRowsPerPartition));
             return this;
         }
 
