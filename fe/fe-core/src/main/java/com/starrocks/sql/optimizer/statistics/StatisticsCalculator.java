@@ -2154,22 +2154,6 @@ public class StatisticsCalculator extends OperatorVisitor<Void, ExpressionContex
         return computeAnalyticNode(context, node.getPartitionExpressions(), node.getAnalyticCall());
     }
 
-    static double estimateAvgRowsPerPartition(Statistics inputStatistics, List<ScalarOperator> partitionExpressions) {
-        double inputRowCount = inputStatistics.getOutputRowCount();
-        if (partitionExpressions.isEmpty()) {
-            return Math.max(1, inputRowCount);
-        }
-        List<ColumnRefOperator> partitionCols = Lists.newArrayList();
-        for (ScalarOperator expr : partitionExpressions) {
-            if (!(expr instanceof ColumnRefOperator column)) {
-                return Math.max(1, inputRowCount);
-            }
-            partitionCols.add(column);
-        }
-        double numPartitions = computeGroupByStatistics(partitionCols, inputStatistics, Maps.newHashMap());
-        return Math.max(1, inputRowCount / numPartitions);
-    }
-
     private Void computeAnalyticNode(ExpressionContext context, List<ScalarOperator> partitionExpressions,
                                      Map<ColumnRefOperator, CallOperator> analyticCall) {
         Preconditions.checkState(context.arity() == 1);
@@ -2179,10 +2163,8 @@ public class StatisticsCalculator extends OperatorVisitor<Void, ExpressionContex
         builder.addColumnStatistics(inputStatistics.getColumnStatistics());
 
         double inputRowCount = inputStatistics.getOutputRowCount();
-        Statistics windowInputStatistics =
-                inputStatistics.withAvgRowsPerPartition(estimateAvgRowsPerPartition(inputStatistics, partitionExpressions));
         analyticCall.forEach((key, value) -> builder.addColumnStatistic(key,
-                ExpressionStatisticCalculator.calculate(value, windowInputStatistics)));
+                WindowFunctionStatisticCalculator.calculate(value, inputStatistics, partitionExpressions)));
 
         builder.setOutputRowCount(inputRowCount);
 

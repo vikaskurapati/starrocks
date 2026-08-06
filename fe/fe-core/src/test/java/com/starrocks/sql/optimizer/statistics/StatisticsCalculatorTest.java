@@ -1392,8 +1392,9 @@ public class StatisticsCalculatorTest {
                 .build();
 
         Assertions.assertEquals(1000,
-                StatisticsCalculator.estimateAvgRowsPerPartition(statistics, Lists.newArrayList()), 0.001);
+                WindowFunctionStatisticCalculator.estimateAvgRowsPerPartition(statistics, Lists.newArrayList()), 0.001);
         Assertions.assertEquals(100,
-                StatisticsCalculator.estimateAvgRowsPerPartition(statistics, Lists.newArrayList(partitionCol)), 0.001);
+                WindowFunctionStatisticCalculator.estimateAvgRowsPerPartition(statistics, Lists.newArrayList(partitionCol)),
+                0.001);
     }
 }

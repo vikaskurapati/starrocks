@@ -78,7 +78,21 @@ public class ExpressionStatisticCalculator {
             LOG.debug("found a NaN row count when calculating column statistic for expr: {}", operator);
             return ColumnStatistic.unknown();
         }
-        return operator.accept(new ExpressionStatisticVisitor(input, rowCount), null);
+        return operator.accept(new ExpressionStatisticVisitor(input, rowCount, OptionalDouble.empty()), null);
+    }
+
+    static ColumnStatistic calculateForWindow(ScalarOperator operator, Statistics input, double avgRowsPerPartition) {
+        if (Double.isNaN(avgRowsPerPartition)) {
+            LOG.debug("found a NaN average row count when calculating column statistic for expr: {}", operator);
+            return ColumnStatistic.unknown();
+        }
+        double rowCount = input != null ? input.getOutputRowCount() : 0;
+        if (Double.isNaN(rowCount)) {
+            LOG.debug("found a NaN row count when calculating column statistic for expr: {}", operator);
+            return ColumnStatistic.unknown();
+        }
+        return operator.accept(new ExpressionStatisticVisitor(input, rowCount, OptionalDouble.of(avgRowsPerPartition)),
+                null);
     }
 
     private record NullableBooleanProbabilities(double pTrue, double pFalse, double pNull) {
@@ -88,13 +102,15 @@ public class ExpressionStatisticCalculator {
         private final Statistics inputStatistics;
         // Some functions estimate need plan node row count, such as COUNT
         private final double rowCount;
+        private final OptionalDouble avgRowsPerPartition;
 
         // Stats for lambda variables.
         private final Map<ColumnRefOperator, ColumnStatistic> mappedStats = new HashMap<>();
 
-        public ExpressionStatisticVisitor(Statistics statistics, double rowCount) {
+        public ExpressionStatisticVisitor(Statistics statistics, double rowCount, OptionalDouble avgRowsPerPartition) {
             this.inputStatistics = statistics;
             this.rowCount = Math.max(1.0, rowCount);
+            this.avgRowsPerPartition = avgRowsPerPartition;
         }
 
         @Override
@@ -553,8 +569,7 @@ public class ExpressionStatisticCalculator {
                     maxValue = inputStatistics.getOutputRowCount();
                     break;
                 case FunctionSet.ROW_NUMBER:
-                    double rowsPerPartition = Math.max(1.0,
-                            inputStatistics.getAvgRowsPerPartition().orElse(rowCount));
+                    double rowsPerPartition = Math.max(1.0, avgRowsPerPartition.orElse(rowCount));
                     minValue = 1;
                     maxValue = rowsPerPartition;
                     distinctValue = rowsPerPartition;
