@@ -1354,6 +1354,20 @@ public class ExpressionStatisticCalculator {
                 case FunctionSet.SUBSTRING:
                 case FunctionSet.REGEXP_REPLACE:
                     return childColumnStatisticList.get(0);
+                case FunctionSet.CONVERT_TZ: {
+                    // Timezone offsets differ by at most 26 hours (same bound as
+                    // ExtractRangePredicateFromScalarApplyRule). Widen the datetime child's
+                    // range by that amount; NDV and nulls are preserved.
+                    ColumnStatistic dt = childColumnStatisticList.get(0);
+                    final double maxOffsetSec = 26 * 3600.0;
+                    return ColumnStatistic.builder()
+                            .setMinValue(dt.getMinValue() - maxOffsetSec)
+                            .setMaxValue(dt.getMaxValue() + maxOffsetSec)
+                            .setNullsFraction(dt.getNullsFraction())
+                            .setAverageRowSize(callOperator.getType().getTypeSize())
+                            .setDistinctValuesCount(dt.getDistinctValuesCount())
+                            .build();
+                }
                 case FunctionSet.CONCAT:
                     distinctValues = Math.min(rowCount,
                             childColumnStatisticList.stream().mapToDouble(ColumnStatistic::getDistinctValuesCount).sum());

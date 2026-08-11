@@ -784,6 +784,40 @@ public class ExpressionStatisticsCalculatorTest {
     }
 
     @Test
+    public void testConvertTzWidensDatetimeRangeByMaxTimezoneOffset() {
+        final double min = 1_600_000_000.0;
+        final double max = 1_700_000_000.0;
+        final double nullsFraction = 0.1;
+        final double distinctValues = 50;
+        final double maxOffsetSec = 26 * 3600.0;
+
+        final ColumnRefOperator dt = new ColumnRefOperator(0, DateType.DATETIME, "dt", true);
+        final Statistics statistics = Statistics.builder()
+                .setOutputRowCount(100)
+                .addColumnStatistic(dt, ColumnStatistic.builder()
+                        .setMinValue(min)
+                        .setMaxValue(max)
+                        .setNullsFraction(nullsFraction)
+                        .setAverageRowSize(DateType.DATETIME.getTypeSize())
+                        .setDistinctValuesCount(distinctValues)
+                        .build())
+                .build();
+        final CallOperator convertTz = new CallOperator(FunctionSet.CONVERT_TZ, DateType.DATETIME,
+                Lists.newArrayList(dt,
+                        ConstantOperator.createVarchar("UTC"),
+                        ConstantOperator.createVarchar("Asia/Shanghai")));
+
+        final ColumnStatistic actual = ExpressionStatisticCalculator.calculate(convertTz, statistics);
+
+        Assertions.assertFalse(actual.isUnknown());
+        Assertions.assertEquals(min - maxOffsetSec, actual.getMinValue(), 0.001);
+        Assertions.assertEquals(max + maxOffsetSec, actual.getMaxValue(), 0.001);
+        Assertions.assertEquals(nullsFraction, actual.getNullsFraction(), 0.001);
+        Assertions.assertEquals(distinctValues, actual.getDistinctValuesCount(), 0.001);
+        Assertions.assertEquals(DateType.DATETIME.getTypeSize(), actual.getAverageRowSize(), 0.001);
+    }
+
+    @Test
     public void testCoalesceReturnsCombinedStatisticsWhenAllThreeInputsAreKnown() {
         // Given COALESCE(input1, input2, input3)
         // CASE WHEN more than two inputs where all have known stats THEN output stat is known END
