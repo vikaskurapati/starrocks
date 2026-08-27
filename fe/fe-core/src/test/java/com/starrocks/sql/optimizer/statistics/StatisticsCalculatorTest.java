@@ -1380,4 +1380,21 @@ public class StatisticsCalculatorTest {
         calculator.estimatorStats();
         Assertions.assertEquals(Statistics.StatsSource.ANALYZE, expressionContext.getStatistics().getStatsSource());
     }
+
+    @Test
+    public void testEstimateAvgRowsPerPartition() {
+        ColumnRefOperator partitionCol = new ColumnRefOperator(0, IntegerType.INT, "id", true);
+        Statistics statistics = Statistics.builder()
+                .addColumnStatistic(partitionCol,
+                        ColumnStatistic.builder().setMinValue(0).setMaxValue(100)
+                                .setDistinctValuesCount(10).setNullsFraction(0).setAverageRowSize(4).build())
+                .setOutputRowCount(1000)
+                .build();
+
+        Assertions.assertEquals(1000,
+                WindowFunctionStatisticCalculator.estimateAvgRowsPerPartition(statistics, Lists.newArrayList()), 0.001);
+        Assertions.assertEquals(100,
+                WindowFunctionStatisticCalculator.estimateAvgRowsPerPartition(statistics, Lists.newArrayList(partitionCol)),
+                0.001);
+    }
 }

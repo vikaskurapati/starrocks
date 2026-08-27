@@ -78,7 +78,21 @@ public class ExpressionStatisticCalculator {
             LOG.debug("found a NaN row count when calculating column statistic for expr: {}", operator);
             return ColumnStatistic.unknown();
         }
-        return operator.accept(new ExpressionStatisticVisitor(input, rowCount), null);
+        return operator.accept(new ExpressionStatisticVisitor(input, rowCount, OptionalDouble.empty()), null);
+    }
+
+    static ColumnStatistic calculateForWindow(ScalarOperator operator, Statistics input, double avgRowsPerPartition) {
+        if (Double.isNaN(avgRowsPerPartition)) {
+            LOG.debug("found a NaN average row count when calculating column statistic for expr: {}", operator);
+            return ColumnStatistic.unknown();
+        }
+        double rowCount = input != null ? input.getOutputRowCount() : 0;
+        if (Double.isNaN(rowCount)) {
+            LOG.debug("found a NaN row count when calculating column statistic for expr: {}", operator);
+            return ColumnStatistic.unknown();
+        }
+        return operator.accept(new ExpressionStatisticVisitor(input, rowCount, OptionalDouble.of(avgRowsPerPartition)),
+                null);
     }
 
     private record NullableBooleanProbabilities(double pTrue, double pFalse, double pNull) {
@@ -88,13 +102,15 @@ public class ExpressionStatisticCalculator {
         private final Statistics inputStatistics;
         // Some functions estimate need plan node row count, such as COUNT
         private final double rowCount;
+        private final OptionalDouble avgRowsPerPartition;
 
         // Stats for lambda variables.
         private final Map<ColumnRefOperator, ColumnStatistic> mappedStats = new HashMap<>();
 
-        public ExpressionStatisticVisitor(Statistics statistics, double rowCount) {
+        public ExpressionStatisticVisitor(Statistics statistics, double rowCount, OptionalDouble avgRowsPerPartition) {
             this.inputStatistics = statistics;
             this.rowCount = Math.max(1.0, rowCount);
+            this.avgRowsPerPartition = avgRowsPerPartition;
         }
 
         @Override
@@ -520,6 +536,12 @@ public class ExpressionStatisticCalculator {
                     "column statistics missing for expr: %s. column statistics: %s",
                     call, childrenColumnStatistics);
 
+            // Nullary functions (COUNT(), ROW_NUMBER(), NOW(), etc.) do not depend on input
+            // column statistics, so handle them before the unknown-stats fallback below.
+            if (call.getChildren().isEmpty()) {
+                return nullaryExpressionCalculate(call);
+            }
+
             if (childrenColumnStatistics.stream().anyMatch(ColumnStatistic::isUnknown) ||
                     inputStatistics.getColumnStatistics().values().stream().allMatch(ColumnStatistic::isUnknown)) {
                 return deriveBasicColStats(call);
@@ -527,8 +549,6 @@ public class ExpressionStatisticCalculator {
 
             if (SPMFunctions.isSPMFunctions(call)) {
                 return SPMFunctions.getSPMFunctionStatistics(call, childrenColumnStatistics).get(0);
-            } else if (call.getChildren().isEmpty()) {
-                return nullaryExpressionCalculate(call);
             } else if (call.getChildren().size() == 1) {
                 return unaryExpressionCalculate(call, childrenColumnStatistics.get(0));
             } else if (call.getChildren().size() == 2) {
@@ -547,6 +567,12 @@ public class ExpressionStatisticCalculator {
                 case FunctionSet.COUNT:
                     minValue = 0;
                     maxValue = inputStatistics.getOutputRowCount();
+                    break;
+                case FunctionSet.ROW_NUMBER:
+                    double rowsPerPartition = Math.max(1.0, avgRowsPerPartition.orElse(rowCount));
+                    minValue = 1;
+                    maxValue = rowsPerPartition;
+                    distinctValue = rowsPerPartition;
                     break;
                 case FunctionSet.RAND:
                 case FunctionSet.RANDOM:

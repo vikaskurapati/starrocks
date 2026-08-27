@@ -2144,27 +2144,29 @@ public class StatisticsCalculator extends OperatorVisitor<Void, ExpressionContex
     public Void visitLogicalAnalytic(LogicalWindowOperator node, ExpressionContext context) {
         PredicateColumnsMgr.getInstance().recordWindowPartitionBy(node.getPartitionExpressions(),
                 optimizerContext.getColumnRefFactory(), context.getOptExpression());
-        return computeAnalyticNode(context, node.getWindowCall());
+        return computeAnalyticNode(context, node.getPartitionExpressions(), node.getWindowCall());
     }
 
     @Override
     public Void visitPhysicalAnalytic(PhysicalWindowOperator node, ExpressionContext context) {
         PredicateColumnsMgr.getInstance().recordWindowPartitionBy(node.getPartitionExpressions(),
                 optimizerContext.getColumnRefFactory(), context.getOptExpression());
-        return computeAnalyticNode(context, node.getAnalyticCall());
+        return computeAnalyticNode(context, node.getPartitionExpressions(), node.getAnalyticCall());
     }
 
-    private Void computeAnalyticNode(ExpressionContext context, Map<ColumnRefOperator, CallOperator> analyticCall) {
+    private Void computeAnalyticNode(ExpressionContext context, List<ScalarOperator> partitionExpressions,
+                                     Map<ColumnRefOperator, CallOperator> analyticCall) {
         Preconditions.checkState(context.arity() == 1);
 
         Statistics.Builder builder = Statistics.builder();
         Statistics inputStatistics = context.getChildStatistics(0);
         builder.addColumnStatistics(inputStatistics.getColumnStatistics());
 
-        analyticCall.forEach((key, value) -> builder
-                .addColumnStatistic(key, ExpressionStatisticCalculator.calculate(value, inputStatistics)));
+        double inputRowCount = inputStatistics.getOutputRowCount();
+        analyticCall.forEach((key, value) -> builder.addColumnStatistic(key,
+                WindowFunctionStatisticCalculator.calculate(value, inputStatistics, partitionExpressions)));
 
-        builder.setOutputRowCount(inputStatistics.getOutputRowCount());
+        builder.setOutputRowCount(inputRowCount);
 
         context.setStatistics(builder.build());
         return visitOperator(context.getOp(), context);
