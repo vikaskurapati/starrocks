@@ -1,0 +1,47 @@
+{
+  "statement": "WITH c AS (SELECT id, rn FROM v_window WHERE source = 1) SELECT id FROM v_window UNION ALL SELECT a.rn FROM c a CROSS JOIN c b",
+  "table_meta": {
+    "window_predicate_repro.t": "CREATE TABLE `t` (\n  `id` int(11) NULL COMMENT \"\",\n  `source` int(11) NULL COMMENT \"\"\n) ENGINE=OLAP \nDUPLICATE KEY(`id`)\nDISTRIBUTED BY HASH(`id`) BUCKETS 1 \nPROPERTIES (\n\"compression\" = \"LZ4\",\n\"fast_schema_evolution\" = \"true\",\n\"replicated_storage\" = \"true\",\n\"replication_num\" = \"1\"\n);",
+    "window_predicate_repro.mv_window": "CREATE MATERIALIZED VIEW `mv_window` (`id`)\nDISTRIBUTED BY HASH(`id`) BUCKETS 1 \nREFRESH DEFERRED MANUAL\nPROPERTIES (\n\"replicated_storage\" = \"true\",\n\"query_rewrite_consistency\" = \"FORCE_MV\",\n\"replication_num\" = \"1\",\n\"storage_medium\" = \"HDD\"\n)\nAS SELECT `v_window`.`id`\nFROM `window_predicate_repro`.`v_window`;"
+  },
+  "table_row_count": {
+    "window_predicate_repro.t": {
+      "t": 100
+    }
+  },
+  "view_meta": {
+    "window_predicate_repro.v_window": "SELECT `window_predicate_repro`.`t`.`id`, `window_predicate_repro`.`t`.`source`, ROW_NUMBER() OVER (ORDER BY `window_predicate_repro`.`t`.`id`) AS `rn`\nFROM `window_predicate_repro`.`t`"
+  },
+  "column_statistics": {
+    "window_predicate_repro.t": {
+      "id": {
+        "version": 1,
+        "min": "-Infinity",
+        "max": "Infinity",
+        "nullsFraction": "0.0",
+        "averageRowSize": "1.0",
+        "distinctValuesCount": "1.0",
+        "collectionSize": "-1.0",
+        "type": "UNKNOWN"
+      },
+      "source": {
+        "version": 1,
+        "min": "-Infinity",
+        "max": "Infinity",
+        "nullsFraction": "0.0",
+        "averageRowSize": "1.0",
+        "distinctValuesCount": "1.0",
+        "collectionSize": "-1.0",
+        "type": "UNKNOWN"
+      }
+    }
+  },
+  "be_number": 1,
+  "be_core_stat": {
+    "numOfHardwareCoresPerBe": "{}",
+    "cachedAvgNumOfHardwareCores": -1
+  },
+  "exception": [
+    "com.starrocks.sql.common.StarRocksPlannerException: only found column statistics: {1: id, 3: row_number()}, but missing statistic of col: 2: source."
+  ]
+}

@@ -175,6 +175,7 @@ public class QueryOptimizer extends Optimizer {
     private MvRewriteStrategy mvRewriteStrategy = new MvRewriteStrategy();
     private final TaskScheduler scheduler = new TaskScheduler();
     private Memo memo;
+    private boolean needsInlinedViewPruning;
 
     // collect all LogicalOlapScanOperators in the query before any optimization
     private final List<LogicalOlapScanOperator> allLogicalOlapScanOperators = Lists.newArrayList();
@@ -731,6 +732,7 @@ public class QueryOptimizer extends Optimizer {
         scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
         scheduler.rewriteIterative(tree, rootTaskContext, new CTEProduceAddProjectionRule());
         scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_PROJECT_RULES);
+        pruneInlinedViewPlan(tree, rootTaskContext, requiredColumns);
 
         // ArrayDistinctAfterAggRule must run before pushDownAggregation,
         // because push down agg won't have array_distinct project
@@ -775,6 +777,7 @@ public class QueryOptimizer extends Optimizer {
 
         // rule based materialized view rewrite
         ruleBasedMaterializedViewRewriteStage2(tree, rootTaskContext, requiredColumns);
+        pruneInlinedViewPlan(tree, rootTaskContext, requiredColumns);
 
         // =============================== Rules after the MV rewrite ===============================
         scheduler.rewriteOnce(tree, rootTaskContext, JsonPathRewriteRule.createForOlapScan());
@@ -824,6 +827,26 @@ public class QueryOptimizer extends Optimizer {
         }
     }
 
+    private void pruneInlinedViewPlan(OptExpression tree, TaskContext rootTaskContext, ColumnRefSet requiredColumns) {
+        if (!needsInlinedViewPruning) {
+            return;
+        }
+        // Re-optimize expanded views after CTE predicate and limit pushdown. Removing unused operators first
+        // exposes the valid predicate-pushdown paths; then prune columns no longer needed above the filters.
+        new SeparateProjectRule().rewrite(tree, rootTaskContext);
+        deriveLogicalProperty(tree);
+        rootTaskContext.setRequiredColumns(requiredColumns.clone());
+        scheduler.rewriteOnce(tree, rootTaskContext, RuleSet.PRUNE_COLUMNS_RULES);
+        scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
+        scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PUSH_DOWN_PREDICATE_RULES);
+        rootTaskContext.setRequiredColumns(requiredColumns.clone());
+        scheduler.rewriteOnce(tree, rootTaskContext, RuleSet.PRUNE_COLUMNS_RULES);
+        scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
+        tree.clearStatsAndInitOutputInfo();
+        deriveLogicalProperty(tree);
+        needsInlinedViewPruning = false;
+    }
+
     // for single scan node, to make sure we can rewrite
     private boolean viewBasedMvRuleRewrite(OptExpression tree, TaskContext rootTaskContext) {
         QueryMaterializationContext queryMaterializationContext = context.getQueryMaterializationContext();
@@ -863,6 +886,7 @@ public class QueryOptimizer extends Optimizer {
                 isRewrittenSuccess = leftViewScanOperators.isEmpty();
                 if (!isRewrittenSuccess) {
                     MvUtils.replaceLogicalViewScanOperator(tree);
+                    needsInlinedViewPruning = true;
                 }
             }
             OptimizerTraceUtil.logMVRewriteRule("VIEW_BASED_MV_REWRITE", "original view scans size: {}, " +
