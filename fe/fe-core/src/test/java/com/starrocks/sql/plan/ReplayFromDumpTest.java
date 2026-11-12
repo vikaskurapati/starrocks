@@ -18,6 +18,8 @@ import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.Pair;
 import com.starrocks.common.profile.Tracers;
+import com.starrocks.planner.OlapScanNode;
+import com.starrocks.planner.SelectNode;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.server.GlobalStateMgr;
@@ -27,6 +29,9 @@ import com.starrocks.sql.optimizer.OptimizerContext;
 import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.base.CTEProperty;
 import com.starrocks.sql.optimizer.dump.QueryDumpInfo;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalFilterOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalUnionOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalWindowOperator;
 import com.starrocks.sql.optimizer.rule.RuleSet;
 import com.starrocks.sql.optimizer.rule.transformation.JoinAssociativityRule;
 import com.starrocks.thrift.TExplainLevel;
@@ -38,6 +43,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.stream.Stream;
 
 public class ReplayFromDumpTest extends ReplayFromDumpTestBase {
@@ -1327,6 +1334,109 @@ public class ReplayFromDumpTest extends ReplayFromDumpTestBase {
                         TExplainLevel.NORMAL);
         PlanTestBase.assertContains(replayPair.second, "5:OlapScanNode\n" +
                 "     TABLE: tbl_5");
+    }
+
+    @Test
+    public void testUnionPredicateColumnPruning() throws Exception {
+        QueryDumpInfo queryDumpInfo = getDumpInfoFromJson(
+                getDumpInfoFromFile("query_dump/union_predicate_column_pruning"));
+        // This test checks the reused CTE plan; keep that choice independent of pruning's effect on costs.
+        queryDumpInfo.getSessionVariable().setCboCTERuseRatio(0);
+        // Use default aggregate pushdown: getPlanFragment() disables it and hides the failure.
+        var execPlan = UtFrameUtils.getNewPlanAndFragmentFromDump(connectContext, queryDumpInfo).second;
+        String plan = execPlan.getExplainString(TExplainLevel.NORMAL);
+        PlanTestBase.assertContains(plan, "MultiCastDataSinks", "TABLE: mv", "UNION");
+
+        var scans = execPlan.getScanNodes().stream()
+                .filter(scan -> scan instanceof OlapScanNode olap && olap.getOlapTable().getName().equals("t"))
+                .toList();
+        Assertions.assertEquals(2, scans.size());
+        for (var scan : scans) {
+            Assertions.assertEquals(1, scan.getConjuncts().size());
+            PlanTestBase.assertContains(scan.getExplainString(), ": source,", "] = 1");
+        }
+
+        var nodes = new ArrayList<>(List.of(execPlan.getPhysicalPlan()));
+        int unionCount = 0;
+        for (int i = 0; i < nodes.size(); i++) {
+            OptExpression node = nodes.get(i);
+            if (node.getOp() instanceof PhysicalUnionOperator union) {
+                unionCount++;
+                Assertions.assertNull(union.getPredicate());
+                Assertions.assertEquals(List.of("id"), union.getOutputColumnRefOp().stream()
+                        .map(column -> column.getName()).toList());
+            }
+            nodes.addAll(node.getInputs());
+        }
+        Assertions.assertEquals(2, unionCount);
+    }
+
+    @Test
+    public void testWindowPredicateColumnPruning() throws Exception {
+        QueryDumpInfo queryDumpInfo = getDumpInfoFromJson(
+                getDumpInfoFromFile("query_dump/window_predicate_column_pruning"));
+        // Exercise the reused CTE path independently of the optimizer's cost-based reuse choice.
+        queryDumpInfo.getSessionVariable().setCboCTERuseRatio(0);
+        // Keep default aggregate pushdown, as in the UNION replay regression.
+        var execPlan = UtFrameUtils.getNewPlanAndFragmentFromDump(connectContext, queryDumpInfo).second;
+        PlanTestBase.assertContains(execPlan.getExplainString(TExplainLevel.NORMAL),
+                "MultiCastDataSinks", "TABLE: mv_window", "UNION", "ANALYTIC");
+        Assertions.assertEquals(1, execPlan.getOutputExprs().size());
+
+        var scans = execPlan.getScanNodes().stream()
+                .filter(scan -> scan instanceof OlapScanNode olap && olap.getOlapTable().getName().equals("t"))
+                .toList();
+        Assertions.assertEquals(1, scans.size());
+        Assertions.assertTrue(scans.get(0).getConjuncts().isEmpty(),
+                "Filtering source at the scan would change ROW_NUMBER over the unpartitioned input");
+        var filters = execPlan.getFragments().stream()
+                .flatMap(fragment -> fragment.collectNodes().stream())
+                .filter(node -> node instanceof SelectNode)
+                .toList();
+        Assertions.assertEquals(1, filters.size());
+        Assertions.assertEquals(1, filters.get(0).getConjuncts().size());
+        PlanTestBase.assertContains(filters.get(0).getExplainString(), "source", "= 1");
+
+        var nodes = new ArrayList<>(List.of(execPlan.getPhysicalPlan()));
+        int windowCount = 0;
+        int unionCount = 0;
+        OptExpression sourceFilter = null;
+        for (int i = 0; i < nodes.size(); i++) {
+            OptExpression node = nodes.get(i);
+            if (node.getOp() instanceof PhysicalWindowOperator window) {
+                windowCount++;
+                Assertions.assertNull(window.getPredicate());
+                Assertions.assertTrue(window.getAnalyticCall().values().stream()
+                        .anyMatch(call -> call.getFnName().equalsIgnoreCase("row_number")));
+                Assertions.assertTrue(node.inputAt(0).getRowOutputInfo().getOutputColRefs().stream()
+                        .anyMatch(column -> column.getName().equals("source")),
+                        "The WINDOW input must retain source until the filter above it is evaluated");
+            }
+            if (node.getOp() instanceof PhysicalUnionOperator union) {
+                unionCount++;
+                Assertions.assertNull(union.getPredicate());
+                Assertions.assertEquals(1, union.getOutputColumnRefOp().size());
+                // UNION widens INT id to match the BIGINT ROW_NUMBER result.
+                Assertions.assertTrue(union.getOutputColumnRefOp().get(0).getType().isBigint());
+                for (var childOutput : union.getChildOutputColumns()) {
+                    Assertions.assertEquals(1, childOutput.size());
+                }
+            }
+            if (node.getOp() instanceof PhysicalFilterOperator filter
+                    && filter.getPredicate().toString().contains("source")) {
+                sourceFilter = node;
+            }
+            nodes.addAll(node.getInputs());
+        }
+        Assertions.assertEquals(1, windowCount);
+        Assertions.assertEquals(1, unionCount);
+        Assertions.assertNotNull(sourceFilter, "The source predicate must remain in the executable plan");
+        var filterInputs = new ArrayList<>(sourceFilter.getInputs());
+        for (int i = 0; i < filterInputs.size(); i++) {
+            filterInputs.addAll(filterInputs.get(i).getInputs());
+        }
+        Assertions.assertTrue(filterInputs.stream().anyMatch(node -> node.getOp() instanceof PhysicalWindowOperator),
+                "The source filter must be evaluated after ROW_NUMBER");
     }
 
     @Test
