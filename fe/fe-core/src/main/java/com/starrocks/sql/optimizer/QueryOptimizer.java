@@ -777,7 +777,13 @@ public class QueryOptimizer extends Optimizer {
 
         // rule based materialized view rewrite
         ruleBasedMaterializedViewRewriteStage2(tree, rootTaskContext, requiredColumns);
-        pruneInlinedViewPlan(tree, rootTaskContext, requiredColumns);
+        if (needsInlinedViewPruning) {
+            pruneInlinedViewPlan(tree, rootTaskContext, requiredColumns);
+            // Late pruning separates projects after the final project-merge pass. Fold them back
+            // so joins inside expanded views remain visible to join reordering in the memo.
+            scheduler.rewriteIterative(tree, rootTaskContext, new MergeTwoProjectRule());
+            scheduler.rewriteIterative(tree, rootTaskContext, new MergeProjectWithChildRule());
+        }
 
         // =============================== Rules after the MV rewrite ===============================
         scheduler.rewriteOnce(tree, rootTaskContext, JsonPathRewriteRule.createForOlapScan());
