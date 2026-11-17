@@ -470,10 +470,6 @@ public class QueryOptimizer extends Optimizer {
                 Utils.isOptHasAppliedRule(tree, op -> op.isOpRuleBitSet(OP_MV_UNION_REWRITE));
         OptimizerTraceUtil.logMVPrepare("is further partition prune: {}", isNeedFurtherPartitionPrune);
         if (isNeedFurtherPartitionPrune && context.getQueryMaterializationContext().hasRewrittenSuccess()) {
-            // reset partition prune bit to do partition prune again.
-            MvUtils.getScanOperator(tree).forEach(scan -> {
-                scan.resetOpRuleBit(OP_PARTITION_PRUNED);
-            });
             // Do predicate push down if union rewrite successes.
             tree = new SeparateProjectRule().rewrite(tree, rootTaskContext);
             deriveLogicalProperty(tree);
@@ -481,8 +477,7 @@ public class QueryOptimizer extends Optimizer {
             rootTaskContext.setRequiredColumns(requiredColumns.clone());
             scheduler.rewriteOnce(tree, rootTaskContext, RuleSet.PRUNE_COLUMNS_RULES);
             scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PUSH_DOWN_PREDICATE_RULES);
-            // It's necessary for external table since its predicate is not used directly after push down.
-            scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PARTITION_PRUNE_RULES);
+            refreshPartitionPruningAfterPredicatePushdown(tree, rootTaskContext);
             scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
             scheduler.rewriteIterative(tree, rootTaskContext, new MVCompensationPruneUnionRule());
             scheduler.rewriteIterative(tree, rootTaskContext, new MergeTwoProjectRule());
@@ -845,12 +840,23 @@ public class QueryOptimizer extends Optimizer {
         scheduler.rewriteOnce(tree, rootTaskContext, RuleSet.PRUNE_COLUMNS_RULES);
         scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
         scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PUSH_DOWN_PREDICATE_RULES);
+        refreshPartitionPruningAfterPredicatePushdown(tree, rootTaskContext);
+        scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
         rootTaskContext.setRequiredColumns(requiredColumns.clone());
         scheduler.rewriteOnce(tree, rootTaskContext, RuleSet.PRUNE_COLUMNS_RULES);
         scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
         tree.clearStatsAndInitOutputInfo();
         deriveLogicalProperty(tree);
         needsInlinedViewPruning = false;
+    }
+
+    private void refreshPartitionPruningAfterPredicatePushdown(OptExpression tree,
+                                                               TaskContext rootTaskContext) {
+        // View plans and MV rewrites can push predicates into scans that were pruned earlier.
+        // Reset the marker so external scans rebuild ScanOperatorPredicates from the new predicates;
+        // the fragment builder consumes those classified predicates, not scan.getPredicate().
+        MvUtils.getScanOperator(tree).forEach(scan -> scan.resetOpRuleBit(OP_PARTITION_PRUNED));
+        scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PARTITION_PRUNE_RULES);
     }
 
     // for single scan node, to make sure we can rewrite
