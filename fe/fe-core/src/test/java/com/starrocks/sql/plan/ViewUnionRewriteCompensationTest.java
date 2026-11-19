@@ -14,12 +14,15 @@
 
 package com.starrocks.sql.plan;
 
+import com.starrocks.catalog.Function;
+import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.MvUpdateInfo;
 import com.starrocks.catalog.Table;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.expression.BinaryType;
+import com.starrocks.sql.ast.expression.ExprUtils;
 import com.starrocks.sql.optimizer.MaterializationContext;
 import com.starrocks.sql.optimizer.MvRewriteContext;
 import com.starrocks.sql.optimizer.OptExpression;
@@ -34,6 +37,8 @@ import com.starrocks.sql.optimizer.base.PhysicalPropertySet;
 import com.starrocks.sql.optimizer.operator.AggType;
 import com.starrocks.sql.optimizer.operator.Projection;
 import com.starrocks.sql.optimizer.operator.logical.LogicalAggregationOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalFilterOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalProjectOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalViewScanOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalProjectOperator;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
@@ -53,6 +58,8 @@ import com.starrocks.sql.optimizer.rule.transformation.materialization.rule.Only
 import com.starrocks.sql.optimizer.task.TaskContext;
 import com.starrocks.sql.optimizer.transformer.LogicalPlan;
 import com.starrocks.sql.optimizer.transformer.RelationTransformer;
+import com.starrocks.sql.optimizer.validate.InputDependenciesChecker;
+import com.starrocks.type.Type;
 import com.starrocks.utframe.UtFrameUtils;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
@@ -78,15 +85,39 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
 
     @Test
     public void testProjectedViewScanPreservesUnionCompensation() throws Exception {
-        assertCompensationSurvivesPlanning(false);
+        assertCompensationSurvivesPlanning(false, ProjectionKind.IDENTITY);
     }
 
     @Test
     public void testAggregateOverProjectedViewScanPreservesUnionCompensation() throws Exception {
-        assertCompensationSurvivesPlanning(true);
+        assertCompensationSurvivesPlanning(true, ProjectionKind.IDENTITY);
     }
 
-    private void assertCompensationSurvivesPlanning(boolean aggregate) throws Exception {
+    @Test
+    public void testAliasedViewScanPreservesUnionCompensation() throws Exception {
+        assertCompensationSurvivesPlanning(false, ProjectionKind.ALIAS);
+    }
+
+    @Test
+    public void testAggregateOverAliasedViewScanPreservesUnionCompensation() throws Exception {
+        assertCompensationSurvivesPlanning(true, ProjectionKind.ALIAS);
+    }
+
+    @Test
+    public void testComputedViewProjectionPreservesUnionCompensation() throws Exception {
+        assertCompensationSurvivesPlanning(false, ProjectionKind.COMPUTED);
+    }
+
+    @Test
+    public void testAggregateOverComputedViewProjectionPreservesUnionCompensation() throws Exception {
+        assertCompensationSurvivesPlanning(true, ProjectionKind.COMPUTED);
+    }
+
+    private enum ProjectionKind {
+        IDENTITY, ALIAS, COMPUTED
+    }
+
+    private void assertCompensationSurvivesPlanning(boolean aggregate, ProjectionKind projectionKind) throws Exception {
         String previousDatabase = connectContext.getDatabase();
         SessionVariable previousSession = connectContext.getSessionVariable();
         SessionVariable session = (SessionVariable) previousSession.clone();
@@ -99,12 +130,13 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
             starRocksAssert.withTable("CREATE TABLE t (id INT NOT NULL, source INT) DUPLICATE KEY(id) "
                     + "DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ('replication_num'='1')");
             starRocksAssert.withView("CREATE VIEW v AS SELECT id, source FROM t");
-            // This MV covers id < 10; its UNION query branch must exclude those rows.
+            // The MV covers only values below 10; its UNION query branch must exclude those rows.
             // A deferred MV supplies view metadata, but no refresh or BE execution is needed here.
             starRocksAssert.withMaterializedView("CREATE MATERIALIZED VIEW mv "
                     + "DISTRIBUTED BY HASH(id) BUCKETS 1 REFRESH DEFERRED MANUAL "
                     + "PROPERTIES ('replication_num'='1','query_rewrite_consistency'='force_mv') "
-                    + "AS SELECT id, source FROM v WHERE id < 10");
+                    + "AS SELECT id, source FROM v WHERE "
+                    + (projectionKind == ProjectionKind.COMPUTED ? "abs(id)" : "id") + " < 10");
 
             ColumnRefFactory factory = new ColumnRefFactory();
             QueryStatement statement = (QueryStatement) UtFrameUtils.parseStmtWithNewParser(
@@ -118,12 +150,24 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
             ColumnRefOperator id = logicalPlan.getOutputColumn().get(0);
             ScalarOperator viewId = view.getProjection().getColumnRefMap().get(id);
             Assertions.assertNotNull(viewId);
+            ColumnRefOperator output = projectionKind == ProjectionKind.IDENTITY
+                    ? id : factory.create("projected_id", id.getType(), id.isNullable());
+            ScalarOperator projectedValue = viewId;
+            ScalarOperator inputValue = id;
+            if (projectionKind == ProjectionKind.COMPUTED) {
+                Function abs = ExprUtils.getBuiltinFunction(
+                        FunctionSet.ABS, new Type[] {id.getType()}, Function.CompareMode.IS_IDENTICAL);
+                Assertions.assertNotNull(abs);
+                projectedValue = new CallOperator(FunctionSet.ABS, id.getType(), List.of(viewId), abs);
+                inputValue = new CallOperator(FunctionSet.ABS, id.getType(), List.of(id), abs);
+            }
+            final ScalarOperator expectedInputValue = inputValue;
 
             view.setOriginalPlanEvaluator(new LogicalViewScanOperator.OptPlanEvaluator(
                     MvUtils.cloneExpression(inlineView), connectContext, view.getOutputColumnSet(), factory));
             LogicalViewScanOperator projectedView = LogicalViewScanOperator.builder()
                     .withOperator(view)
-                    .setProjection(new Projection(Map.of(id, viewId)))
+                    .setProjection(new Projection(Map.of(output, projectedValue)))
                     .build();
             OptExpression query = OptExpression.create(projectedView);
             Assertions.assertNotNull(query.getOp().getProjection(),
@@ -131,17 +175,17 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
             if (aggregate) {
                 // A grouping-only aggregate exercises AggregateScanRule's inputAt(0) delegation.
                 query = OptExpression.create(new LogicalAggregationOperator(
-                        AggType.GLOBAL, List.of(id), Map.<ColumnRefOperator, CallOperator>of()), query);
+                        AggType.GLOBAL, List.of(output), Map.<ColumnRefOperator, CallOperator>of()), query);
             }
 
             OptimizerContext context = OptimizerFactory.initContext(connectContext, factory);
             context.setTaskContext(new TaskContext(
-                    context, new PhysicalPropertySet(), new ColumnRefSet(List.of(id)), Double.MAX_VALUE));
+                    context, new PhysicalPropertySet(), new ColumnRefSet(List.of(output)), Double.MAX_VALUE));
             MaterializedView mv = starRocksAssert.getMv(DATABASE, "mv");
             Table baseTable = starRocksAssert.getTable(DATABASE, "t");
             ReplaceColumnRefRewriter identity = new ReplaceColumnRefRewriter(Map.of());
             PredicateSplit queryPredicates = PredicateSplit.splitPredicate(ConstantOperator.TRUE);
-            ScalarOperator coveredRows = new BinaryPredicateOperator(BinaryType.LT, id, ConstantOperator.createInt(10));
+            ScalarOperator coveredRows = new BinaryPredicateOperator(BinaryType.LT, output, ConstantOperator.createInt(10));
             PredicateSplit mvPredicates = PredicateSplit.splitPredicate(coveredRows);
             MaterializationContext materialization = new MaterializationContext(context, mv, inlineView,
                     factory, factory, List.of(baseTable), List.of(baseTable),
@@ -160,8 +204,17 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
             Assertions.assertNotNull(compensated, "The query compensation branch must be constructed");
             Assertions.assertTrue(planNodes(compensated).stream()
                             .flatMap(node -> Utils.extractConjuncts(node.getOp().getPredicate()).stream())
-                            .anyMatch(predicate -> excludesCoveredRows(predicate, id)),
-                    "The rewriter must construct id >= 10 before the optimizer processes the branch");
+                            .anyMatch(predicate -> excludesCoveredRows(predicate, output)),
+                    "The rewriter must construct the exclusion before the optimizer processes the branch");
+            OptExpression queryBranch = aggregate ? compensated.inputAt(0) : compensated;
+            Assertions.assertInstanceOf(LogicalFilterOperator.class, queryBranch.getOp(),
+                    "A Project cannot evaluate an attached predicate");
+            Assertions.assertInstanceOf(LogicalProjectOperator.class, queryBranch.inputAt(0).getOp());
+            Assertions.assertNull(queryBranch.inputAt(0).getOp().getPredicate());
+            Assertions.assertTrue(queryBranch.inputAt(0).getOutputColumns()
+                            .containsAll(queryBranch.getOp().getPredicate().getUsedColumns()),
+                    "The filter must reference the Project's output, before alias/expression substitution");
+            InputDependenciesChecker.getInstance().validate(compensated, context.getTaskContext());
 
             // Run the ordinary optimizer on the returned query branch. The exclusion must survive
             // project merging and physical implementation, not merely exist on a logical project.
@@ -169,12 +222,14 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
             OptimizerContext planningContext = OptimizerFactory.initContext(
                     connectContext, factory, new OptimizerOptions());
             OptExpression physical = OptimizerFactory.create(planningContext).optimize(
-                    compensated, new PhysicalPropertySet(), new ColumnRefSet(List.of(id)));
+                    compensated, new PhysicalPropertySet(), new ColumnRefSet(List.of(output)));
+            InputDependenciesChecker.getInstance().validate(physical, planningContext.getTaskContext());
             Assertions.assertTrue(planNodes(physical).stream()
                             .filter(node -> !(node.getOp() instanceof PhysicalProjectOperator))
                             .flatMap(node -> Utils.extractConjuncts(node.getOp().getPredicate()).stream())
-                            .anyMatch(predicate -> excludesCoveredRows(predicate, id)),
-                    () -> "The query branch lost id >= 10 and would overlap the MV's id < 10 rows.\n"
+                            .anyMatch(predicate -> excludesCoveredRows(predicate, expectedInputValue)),
+                    () -> "The query branch lost the exclusion for " + expectedInputValue
+                            + " >= 10 and would overlap the MV's rows.\n"
                             + physical.debugString());
         } finally {
             try {
@@ -186,10 +241,10 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
         }
     }
 
-    private static boolean excludesCoveredRows(ScalarOperator predicate, ColumnRefOperator id) {
+    private static boolean excludesCoveredRows(ScalarOperator predicate, ScalarOperator value) {
         return predicate instanceof BinaryPredicateOperator binary
                 && binary.getBinaryType() == BinaryType.GE
-                && binary.getChild(0).equals(id)
+                && binary.getChild(0).equals(value)
                 && binary.getChild(1).equals(ConstantOperator.createInt(10));
     }
 

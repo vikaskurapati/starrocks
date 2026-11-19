@@ -64,6 +64,7 @@ import com.starrocks.sql.optimizer.operator.logical.LogicalFilterOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalJoinOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalOlapScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalProjectOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalUnionOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalViewScanOperator;
@@ -2076,6 +2077,11 @@ public class MaterializedViewRewriter implements IMaterializedViewRewriter {
     // pushdown predicates on join nodes
     // the OptExpression will be modified in place
     private OptExpression pushdownPredicatesForJoin(OptExpression optExpression, ScalarOperator predicate) {
+        if (optExpression.getOp() instanceof LogicalProjectOperator && predicate != null) {
+            // Compensation uses the Project's output columns. Keep it in a Filter so existing
+            // pushdown rules map aliases and expressions before evaluating it below the Project.
+            return OptExpression.create(new LogicalFilterOperator(predicate), optExpression);
+        }
         if (!(optExpression.getOp() instanceof LogicalJoinOperator)) {
             if (predicate != null) {
                 // predicate cannot be pushdown, we should add it optExpression
