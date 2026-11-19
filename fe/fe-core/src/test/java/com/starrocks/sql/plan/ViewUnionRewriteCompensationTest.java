@@ -20,6 +20,7 @@ import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.MvUpdateInfo;
 import com.starrocks.catalog.Table;
 import com.starrocks.qe.SessionVariable;
+import com.starrocks.sql.ast.JoinOperator;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.expression.BinaryType;
 import com.starrocks.sql.ast.expression.ExprUtils;
@@ -38,6 +39,7 @@ import com.starrocks.sql.optimizer.operator.AggType;
 import com.starrocks.sql.optimizer.operator.Projection;
 import com.starrocks.sql.optimizer.operator.logical.LogicalAggregationOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalFilterOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalJoinOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalProjectOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalViewScanOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalProjectOperator;
@@ -54,6 +56,7 @@ import com.starrocks.sql.optimizer.rule.transformation.materialization.MvUtils;
 import com.starrocks.sql.optimizer.rule.transformation.materialization.PredicateSplit;
 import com.starrocks.sql.optimizer.rule.transformation.materialization.RewriteContext;
 import com.starrocks.sql.optimizer.rule.transformation.materialization.rule.AggregateScanRule;
+import com.starrocks.sql.optimizer.rule.transformation.materialization.rule.OnlyJoinRule;
 import com.starrocks.sql.optimizer.rule.transformation.materialization.rule.OnlyScanRule;
 import com.starrocks.sql.optimizer.task.TaskContext;
 import com.starrocks.sql.optimizer.transformer.LogicalPlan;
@@ -111,6 +114,86 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
     @Test
     public void testAggregateOverComputedViewProjectionPreservesUnionCompensation() throws Exception {
         assertCompensationSurvivesPlanning(true, ProjectionKind.COMPUTED);
+    }
+
+    @Test
+    public void testJoinOverProjectedViewsPreservesUnionCompensation() throws Exception {
+        String previousDatabase = connectContext.getDatabase();
+        SessionVariable previousSession = connectContext.getSessionVariable();
+        SessionVariable session = previousSession.clone();
+        session.setEnableMaterializedViewRewrite(true);
+        session.setEnableViewBasedMvRewrite(true);
+        session.setEnableMaterializedViewTextMatchRewrite(false);
+        connectContext.setSessionVariable(session);
+        try {
+            starRocksAssert.withDatabase(DATABASE).useDatabase(DATABASE);
+            starRocksAssert.withTable("CREATE TABLE t (id INT NOT NULL, source INT) DUPLICATE KEY(id) "
+                    + "DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES ('replication_num'='1')");
+            starRocksAssert.withView("CREATE VIEW v AS SELECT id, source FROM t");
+            starRocksAssert.withView("CREATE VIEW w AS SELECT id, source FROM t");
+            starRocksAssert.withMaterializedView("CREATE MATERIALIZED VIEW mv "
+                    + "DISTRIBUTED BY HASH(id) BUCKETS 1 REFRESH DEFERRED MANUAL "
+                    + "PROPERTIES ('replication_num'='1','query_rewrite_consistency'='force_mv') "
+                    + "AS SELECT a.id FROM v a JOIN w b ON a.id = b.id WHERE a.id < 10");
+            ColumnRefFactory factory = new ColumnRefFactory();
+            QueryStatement statement = (QueryStatement) UtFrameUtils.parseStmtWithNewParser(
+                    "SELECT a.id, b.id FROM v a JOIN w b ON a.id = b.id", connectContext);
+            LogicalPlan logical = new RelationTransformer(factory, connectContext)
+                    .transform(statement.getQueryRelation());
+            List<OptExpression> viewPlans = planNodes(logical.getRoot()).stream()
+                    .filter(node -> node.getOp().getEquivalentOp() instanceof LogicalViewScanOperator).toList();
+            Assertions.assertEquals(2, viewPlans.size());
+            List<OptExpression> viewScans = new ArrayList<>();
+            for (int i = 0; i < viewPlans.size(); i++) {
+                OptExpression inline = viewPlans.get(i);
+                LogicalViewScanOperator view = (LogicalViewScanOperator) inline.getOp().getEquivalentOp();
+                ColumnRefOperator id = logical.getOutputColumn().get(i);
+                view.setOriginalPlanEvaluator(new LogicalViewScanOperator.OptPlanEvaluator(
+                        MvUtils.cloneExpression(inline), connectContext, view.getOutputColumnSet(), factory));
+                viewScans.add(OptExpression.create(LogicalViewScanOperator.builder().withOperator(view)
+                        .setProjection(new Projection(Map.of(id, view.getProjection().getColumnRefMap().get(id))))
+                        .build()));
+            }
+            ColumnRefOperator leftId = logical.getOutputColumn().get(0);
+            ColumnRefOperator rightId = logical.getOutputColumn().get(1);
+            OptExpression query = OptExpression.create(new LogicalJoinOperator(JoinOperator.INNER_JOIN,
+                    new BinaryPredicateOperator(BinaryType.EQ, leftId, rightId)), viewScans);
+            OptimizerContext context = OptimizerFactory.initContext(connectContext, factory);
+            context.setTaskContext(new TaskContext(context, new PhysicalPropertySet(),
+                    new ColumnRefSet(List.of(leftId)), Double.MAX_VALUE));
+            MaterializedView mv = starRocksAssert.getMv(DATABASE, "mv");
+            Table base = starRocksAssert.getTable(DATABASE, "t");
+            PredicateSplit queryPredicates = PredicateSplit.splitPredicate(ConstantOperator.TRUE);
+            ScalarOperator coveredRows = new BinaryPredicateOperator(BinaryType.LT, leftId,
+                    ConstantOperator.createInt(10));
+            ReplaceColumnRefRewriter identity = new ReplaceColumnRefRewriter(Map.of());
+            MaterializationContext materialization = new MaterializationContext(context, mv, logical.getRoot(),
+                    factory, factory, List.of(base), List.of(base), MvUpdateInfo.noRefresh(mv), List.of(leftId), 0);
+            MvRewriteContext mvRewriteContext = new MvRewriteContext(materialization, MvUtils.getAllTables(query),
+                    query, identity, queryPredicates, List.of(), OnlyJoinRule.getInstance());
+            RewriteContext rewriteContext = new RewriteContext(query, queryPredicates, new EquivalenceClasses(),
+                    Map.of(), factory, identity, logical.getRoot(), PredicateSplit.splitPredicate(coveredRows),
+                    Map.of(), factory, identity, Map.of(), Set.copyOf(factory.getColumnRefs()), context);
+            OptExpression compensated = new MaterializedViewRewriter(mvRewriteContext)
+                    .doQueryBasedRewrite(rewriteContext, coveredRows, query);
+            Assertions.assertNotNull(compensated);
+
+            session.setEnableMaterializedViewRewrite(false);
+            OptimizerContext planningContext = OptimizerFactory.initContext(connectContext, factory);
+            OptExpression physical = OptimizerFactory.create(planningContext).optimize(
+                    compensated, new PhysicalPropertySet(), new ColumnRefSet(List.of(leftId)));
+            InputDependenciesChecker.getInstance().validate(physical, planningContext.getTaskContext());
+            Assertions.assertTrue(planNodes(physical).stream()
+                            .flatMap(node -> Utils.extractConjuncts(node.getOp().getPredicate()).stream())
+                            .anyMatch(predicate -> excludesCoveredRows(predicate, leftId)
+                                    || excludesCoveredRows(predicate, rightId)),
+                    () -> "Join compensation lost id >= 10 from its projected view children.\n"
+                            + physical.debugString());
+        } finally {
+            starRocksAssert.dropDatabase(DATABASE);
+            connectContext.setDatabase(previousDatabase);
+            connectContext.setSessionVariable(previousSession);
+        }
     }
 
     private enum ProjectionKind {

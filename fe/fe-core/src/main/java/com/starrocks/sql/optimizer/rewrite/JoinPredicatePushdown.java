@@ -30,6 +30,7 @@ import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.logical.LogicalFilterOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalJoinOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalProjectOperator;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CompoundPredicateOperator;
@@ -331,11 +332,7 @@ public class JoinPredicatePushdown {
             Operator leftOp = root.inputAt(0).getOp().cast();
             ScalarOperator newPredicate =
                     canonizePredicate(Utils.compoundAnd(Utils.compoundAnd(set), leftOp.getPredicate()));
-            LogicalOperator.Builder builder = OperatorBuilderFactory.build(leftOp);
-            builder.withOperator(leftOp);
-            builder.setPredicate(newPredicate);
-            Operator newOp = builder.build();
-            OptExpression newLeft = OptExpression.create(newOp, root.inputAt(0).getInputs());
+            OptExpression newLeft = attachChildPredicate(root.inputAt(0), newPredicate);
             root.getInputs().set(0, newLeft);
         }
 
@@ -344,13 +341,23 @@ public class JoinPredicatePushdown {
             Operator rightOp = root.inputAt(1).getOp();
             ScalarOperator newPredicate =
                     canonizePredicate(Utils.compoundAnd(Utils.compoundAnd(set), rightOp.getPredicate()));
-            LogicalOperator.Builder builder = OperatorBuilderFactory.build(rightOp);
-            builder.withOperator(rightOp);
-            builder.setPredicate(newPredicate);
-            Operator newOp = builder.build();
-            OptExpression newRight = OptExpression.create(newOp, root.inputAt(1).getInputs());
+            OptExpression newRight = attachChildPredicate(root.inputAt(1), newPredicate);
             root.getInputs().set(1, newRight);
         }
+    }
+
+    private OptExpression attachChildPredicate(OptExpression child, ScalarOperator predicate) {
+        LogicalOperator.Builder builder = OperatorBuilderFactory.build(child.getOp());
+        builder.withOperator(child.getOp());
+        if (child.getOp() instanceof LogicalProjectOperator) {
+            // Projects only produce columns. Keep the predicate above them so the normal
+            // filter pushdown rule can apply their column mappings without losing it.
+            builder.setPredicate(null);
+            OptExpression project = OptExpression.create(builder.build(), child.getInputs());
+            return OptExpression.create(new LogicalFilterOperator(predicate), project);
+        }
+        builder.setPredicate(predicate);
+        return OptExpression.create(builder.build(), child.getInputs());
     }
 
     private void pushDownPredicateByFilter(
