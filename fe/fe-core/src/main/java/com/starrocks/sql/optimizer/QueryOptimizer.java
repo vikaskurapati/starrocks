@@ -39,6 +39,7 @@ import com.starrocks.sql.optimizer.operator.logical.LogicalTreeAnchorOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalViewScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalWindowOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalOlapScanOperator;
+import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rule.RuleSet;
 import com.starrocks.sql.optimizer.rule.ivm.IvmRewriter;
 import com.starrocks.sql.optimizer.rule.join.JoinReorderFactory;
@@ -158,7 +159,10 @@ import org.apache.commons.collections4.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -175,6 +179,7 @@ public class QueryOptimizer extends Optimizer {
     private MvRewriteStrategy mvRewriteStrategy = new MvRewriteStrategy();
     private final TaskScheduler scheduler = new TaskScheduler();
     private Memo memo;
+    private boolean needsInlinedViewPruning;
 
     // collect all LogicalOlapScanOperators in the query before any optimization
     private final List<LogicalOlapScanOperator> allLogicalOlapScanOperators = Lists.newArrayList();
@@ -469,10 +474,6 @@ public class QueryOptimizer extends Optimizer {
                 Utils.isOptHasAppliedRule(tree, op -> op.isOpRuleBitSet(OP_MV_UNION_REWRITE));
         OptimizerTraceUtil.logMVPrepare("is further partition prune: {}", isNeedFurtherPartitionPrune);
         if (isNeedFurtherPartitionPrune && context.getQueryMaterializationContext().hasRewrittenSuccess()) {
-            // reset partition prune bit to do partition prune again.
-            MvUtils.getScanOperator(tree).forEach(scan -> {
-                scan.resetOpRuleBit(OP_PARTITION_PRUNED);
-            });
             // Do predicate push down if union rewrite successes.
             tree = new SeparateProjectRule().rewrite(tree, rootTaskContext);
             deriveLogicalProperty(tree);
@@ -480,8 +481,7 @@ public class QueryOptimizer extends Optimizer {
             rootTaskContext.setRequiredColumns(requiredColumns.clone());
             scheduler.rewriteOnce(tree, rootTaskContext, RuleSet.PRUNE_COLUMNS_RULES);
             scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PUSH_DOWN_PREDICATE_RULES);
-            // It's necessary for external table since its predicate is not used directly after push down.
-            scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PARTITION_PRUNE_RULES);
+            refreshPartitionPruningAfterPredicatePushdown(tree, rootTaskContext);
             scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
             scheduler.rewriteIterative(tree, rootTaskContext, new MVCompensationPruneUnionRule());
             scheduler.rewriteIterative(tree, rootTaskContext, new MergeTwoProjectRule());
@@ -731,6 +731,7 @@ public class QueryOptimizer extends Optimizer {
         scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
         scheduler.rewriteIterative(tree, rootTaskContext, new CTEProduceAddProjectionRule());
         scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_PROJECT_RULES);
+        pruneInlinedViewPlan(tree, rootTaskContext, requiredColumns);
 
         // ArrayDistinctAfterAggRule must run before pushDownAggregation,
         // because push down agg won't have array_distinct project
@@ -775,6 +776,13 @@ public class QueryOptimizer extends Optimizer {
 
         // rule based materialized view rewrite
         ruleBasedMaterializedViewRewriteStage2(tree, rootTaskContext, requiredColumns);
+        if (needsInlinedViewPruning) {
+            pruneInlinedViewPlan(tree, rootTaskContext, requiredColumns);
+            // Late pruning separates projects after the final project-merge pass. Fold them back
+            // so joins inside expanded views remain visible to join reordering in the memo.
+            scheduler.rewriteIterative(tree, rootTaskContext, new MergeTwoProjectRule());
+            scheduler.rewriteIterative(tree, rootTaskContext, new MergeProjectWithChildRule());
+        }
 
         // =============================== Rules after the MV rewrite ===============================
         scheduler.rewriteOnce(tree, rootTaskContext, JsonPathRewriteRule.createForOlapScan());
@@ -824,6 +832,58 @@ public class QueryOptimizer extends Optimizer {
         }
     }
 
+    private void pruneInlinedViewPlan(OptExpression tree, TaskContext rootTaskContext, ColumnRefSet requiredColumns) {
+        if (!needsInlinedViewPruning) {
+            return;
+        }
+        // Re-optimize expanded views after CTE predicate and limit pushdown. Removing unused operators first
+        // exposes the valid predicate-pushdown paths; then prune columns no longer needed above the filters.
+        new SeparateProjectRule().rewrite(tree, rootTaskContext);
+        deriveLogicalProperty(tree);
+        rootTaskContext.setRequiredColumns(requiredColumns.clone());
+        scheduler.rewriteOnce(tree, rootTaskContext, RuleSet.PRUNE_COLUMNS_RULES);
+        scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
+        // Builders replace scan instances during pushdown. All column identities remain stable,
+        // so use them to recognize unchanged scans and retain their existing partition pruning.
+        Map<ColumnRefSet, ScalarOperator> scanPredicates = new HashMap<>();
+        for (var scan : MvUtils.getScanOperator(tree)) {
+            ScalarOperator predicate = scan.getPredicate();
+            scanPredicates.put(new ColumnRefSet(scan.getColumnMetaToColRefMap().values()),
+                    predicate == null ? null : predicate.clone());
+        }
+        scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PUSH_DOWN_PREDICATE_RULES);
+        refreshPartitionPruningAfterPredicatePushdown(tree, rootTaskContext, scanPredicates);
+        scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
+        rootTaskContext.setRequiredColumns(requiredColumns.clone());
+        scheduler.rewriteOnce(tree, rootTaskContext, RuleSet.PRUNE_COLUMNS_RULES);
+        scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
+        tree.clearStatsAndInitOutputInfo();
+        deriveLogicalProperty(tree);
+        needsInlinedViewPruning = false;
+    }
+
+    private void refreshPartitionPruningAfterPredicatePushdown(OptExpression tree,
+                                                               TaskContext rootTaskContext) {
+        // UNION compensation can change partition coverage as well as predicates.
+        refreshPartitionPruningAfterPredicatePushdown(tree, rootTaskContext, null);
+    }
+
+    private void refreshPartitionPruningAfterPredicatePushdown(OptExpression tree,
+                                                               TaskContext rootTaskContext,
+                                                               Map<ColumnRefSet, ScalarOperator> previousPredicates) {
+        // View plans and MV rewrites can push predicates into scans that were pruned earlier.
+        // Reset the marker so external scans rebuild ScanOperatorPredicates from the new predicates;
+        // the fragment builder consumes those classified predicates, not scan.getPredicate().
+        for (var scan : MvUtils.getScanOperator(tree)) {
+            ColumnRefSet columns = new ColumnRefSet(scan.getColumnMetaToColRefMap().values());
+            if (previousPredicates == null || !previousPredicates.containsKey(columns)
+                    || !Objects.equals(previousPredicates.get(columns), scan.getPredicate())) {
+                scan.resetOpRuleBit(OP_PARTITION_PRUNED);
+            }
+        }
+        scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PARTITION_PRUNE_RULES);
+    }
+
     // for single scan node, to make sure we can rewrite
     private boolean viewBasedMvRuleRewrite(OptExpression tree, TaskContext rootTaskContext) {
         QueryMaterializationContext queryMaterializationContext = context.getQueryMaterializationContext();
@@ -863,6 +923,7 @@ public class QueryOptimizer extends Optimizer {
                 isRewrittenSuccess = leftViewScanOperators.isEmpty();
                 if (!isRewrittenSuccess) {
                     MvUtils.replaceLogicalViewScanOperator(tree);
+                    needsInlinedViewPruning = true;
                 }
             }
             OptimizerTraceUtil.logMVRewriteRule("VIEW_BASED_MV_REWRITE", "original view scans size: {}, " +

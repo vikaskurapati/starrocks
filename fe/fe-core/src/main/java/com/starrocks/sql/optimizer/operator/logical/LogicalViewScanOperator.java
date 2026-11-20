@@ -125,7 +125,9 @@ public class LogicalViewScanOperator  extends LogicalScanOperator {
                 originalPlan = Optional.of(optExpression);
             }
             Preconditions.checkArgument(originalPlan.isPresent(), "Original plan is not set");
-            return originalPlan.get();
+            // Callers normalize and prune operators in place. Each candidate must own its
+            // complete inline tree so these edits cannot change the cached plan for later reuse.
+            return MvUtils.cloneExpression(originalPlan.get());
         }
     }
 
