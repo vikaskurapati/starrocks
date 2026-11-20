@@ -2077,13 +2077,22 @@ public class MaterializedViewRewriter implements IMaterializedViewRewriter {
     // pushdown predicates on join nodes
     // the OptExpression will be modified in place
     private OptExpression pushdownPredicatesForJoin(OptExpression optExpression, ScalarOperator predicate) {
-        if (optExpression.getOp() instanceof LogicalProjectOperator && predicate != null) {
-            // Compensation uses the Project's output columns. Keep it in a Filter so existing
-            // pushdown rules map aliases and expressions before evaluating it below the Project.
-            return OptExpression.create(new LogicalFilterOperator(predicate), optExpression);
-        }
         if (!(optExpression.getOp() instanceof LogicalJoinOperator)) {
             if (predicate != null) {
+                if (!(optExpression.getOp() instanceof LogicalScanOperator)) {
+                    // Pruning and implementation rules preserve explicit Filters for every operator.
+                    // Compensation was mapped through an attached projection in doQueryBasedRewrite,
+                    // so place it below that projection where its input columns are still available.
+                    Projection projection = optExpression.getOp().getProjection();
+                    if (projection != null) {
+                        Operator.Builder builder = OperatorBuilderFactory.build(optExpression.getOp());
+                        builder.withOperator(optExpression.getOp()).setProjection(null);
+                        OptExpression input = OptExpression.create(builder.build(), optExpression.getInputs());
+                        OptExpression filter = OptExpression.create(new LogicalFilterOperator(predicate), input);
+                        return OptExpression.create(new LogicalProjectOperator(projection.getColumnRefMap()), filter);
+                    }
+                    return OptExpression.create(new LogicalFilterOperator(predicate), optExpression);
+                }
                 // predicate cannot be pushdown, we should add it optExpression
                 Operator.Builder builder = OperatorBuilderFactory.build(optExpression.getOp());
                 builder.withOperator(optExpression.getOp());
