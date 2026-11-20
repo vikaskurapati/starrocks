@@ -63,7 +63,11 @@ import com.starrocks.sql.optimizer.transformer.LogicalPlan;
 import com.starrocks.sql.optimizer.transformer.RelationTransformer;
 import com.starrocks.sql.optimizer.validate.InputDependenciesChecker;
 import com.starrocks.type.Type;
+import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
+import mockit.Invocation;
+import mockit.Mock;
+import mockit.MockUp;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -121,6 +125,35 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
     @Test
     public void testAggregateOverComputedViewProjectionPreservesUnionCompensation() throws Exception {
         assertCompensationSurvivesPlanning(true, ProjectionKind.COMPUTED);
+    }
+
+    @Test
+    public void testJoinCompensationRestoresSessionWhenDatabaseCleanupFails() throws Exception {
+        String previousDatabase = connectContext.getDatabase();
+        SessionVariable previousSession = connectContext.getSessionVariable();
+        String failureMessage = "injected database cleanup failure";
+        new MockUp<StarRocksAssert>() {
+            @Mock
+            public StarRocksAssert dropDatabase(Invocation invocation, String database) throws Exception {
+                // Remove the test metadata, then fail at the cleanup boundary without leaking the fixture.
+                StarRocksAssert result = invocation.proceed(database);
+                if (database.equals(DATABASE)) {
+                    throw new IllegalStateException(failureMessage);
+                }
+                return result;
+            }
+        };
+        try {
+            IllegalStateException failure = Assertions.assertThrows(IllegalStateException.class,
+                    this::testJoinOverProjectedViewsPreservesUnionCompensation);
+            Assertions.assertEquals(failureMessage, failure.getMessage());
+            Assertions.assertSame(previousSession, connectContext.getSessionVariable(),
+                    "A failed database cleanup must still restore the caller's session settings");
+            Assertions.assertEquals(previousDatabase, connectContext.getDatabase());
+        } finally {
+            connectContext.setDatabase(previousDatabase);
+            connectContext.setSessionVariable(previousSession);
+        }
     }
 
     @Test
@@ -197,9 +230,12 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
                     () -> "Join compensation lost id >= 10 from its projected view children.\n"
                             + physical.debugString());
         } finally {
-            starRocksAssert.dropDatabase(DATABASE);
-            connectContext.setDatabase(previousDatabase);
-            connectContext.setSessionVariable(previousSession);
+            try {
+                starRocksAssert.dropDatabase(DATABASE);
+            } finally {
+                connectContext.setDatabase(previousDatabase);
+                connectContext.setSessionVariable(previousSession);
+            }
         }
     }
 
