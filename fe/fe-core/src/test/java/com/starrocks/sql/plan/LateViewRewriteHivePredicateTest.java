@@ -14,21 +14,28 @@
 
 package com.starrocks.sql.plan;
 
+import com.starrocks.connector.ConnectorMetadataRequestContext;
 import com.starrocks.planner.HdfsScanNode;
 import com.starrocks.planner.OlapScanNode;
 import com.starrocks.qe.SessionVariable;
+import com.starrocks.server.MetadataMgr;
 import com.starrocks.sql.ast.expression.ExprToSql;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalHiveScanOperator;
 import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.utframe.UtFrameUtils;
+import mockit.Invocation;
+import mockit.Mock;
+import mockit.MockUp;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class LateViewRewriteHivePredicateTest extends PlanTestNoneDBBase {
     private static final String DATABASE = "late_view_hive_predicate_repro";
@@ -49,6 +56,69 @@ public class LateViewRewriteHivePredicateTest extends PlanTestNoneDBBase {
     @Test
     public void testLateViewRewritePreservesExecutableHivePredicate() throws Exception {
         assertExecutableHivePredicate(false);
+    }
+
+    @Test
+    public void testLateViewRewriteDoesNotRefreshUnchangedExternalScan() throws Exception {
+        String previousDatabase = connectContext.getDatabase();
+        SessionVariable previousSession = connectContext.getSessionVariable();
+        SessionVariable session = previousSession.clone();
+        session.setEnableMaterializedViewRewrite(true);
+        session.setEnableViewBasedMvRewrite(true);
+        session.setEnableCBOViewBasedMvRewrite(false);
+        session.setEnableMaterializedViewMultiStagesRewrite(false);
+        session.setMaterializedViewRewriteMode("default");
+        session.setEnableForceRuleBasedMvRewrite(true);
+        session.setEnableCboBasedMvRewrite(false);
+        session.setEnableMaterializedViewTextMatchRewrite(false);
+        session.setEnableMaterializedViewUnionRewrite(false);
+        session.setOptimizerExecuteTimeout(120000);
+        session.setOptimizerMaterializedViewTimeLimitMillis(120000);
+        connectContext.setSessionVariable(session);
+        AtomicInteger changedLookups = new AtomicInteger();
+        AtomicInteger unchangedLookups = new AtomicInteger();
+        new MockUp<MetadataMgr>() {
+            @Mock
+            public List<String> listPartitionNames(Invocation invocation, String catalog, String database, String table,
+                                                   ConnectorMetadataRequestContext request) {
+                if (Arrays.stream(Thread.currentThread().getStackTrace())
+                        .anyMatch(frame -> frame.getMethodName().equals("refreshPartitionPruningAfterPredicatePushdown"))) {
+                    if (table.equals("t1")) {
+                        changedLookups.incrementAndGet();
+                    } else if (table.equals("part_tbl1")) {
+                        unchangedLookups.incrementAndGet();
+                    }
+                }
+                return invocation.proceed(catalog, database, table, request);
+            }
+        };
+        try {
+            starRocksAssert.withDatabase(DATABASE).useDatabase(DATABASE);
+            starRocksAssert.withView("CREATE VIEW v AS SELECT c1 AS id, c2 AS source FROM hive0.partitioned_db.t1");
+            starRocksAssert.withMaterializedView("CREATE MATERIALIZED VIEW mv DISTRIBUTED BY HASH(id) BUCKETS 1 "
+                    + "REFRESH DEFERRED MANUAL "
+                    + "PROPERTIES ('replication_num'='1','query_rewrite_consistency'='force_mv') AS SELECT id FROM v");
+            ExecPlan plan = UtFrameUtils.getPlanAndFragment(connectContext, "SELECT id FROM v UNION ALL "
+                    + "SELECT x.id FROM v x CROSS JOIN hive0.partitioned_db.part_tbl1 c WHERE x.source = 'x'").second;
+            String explain = plan.getExplainString(TExplainLevel.NORMAL);
+            PlanTestBase.assertContains(explain, "TABLE: mv", "TABLE: part_tbl1");
+            Assertions.assertTrue(changedLookups.get() > 0,
+                    "Exercise late partition refresh for the view scan with the newly pushed c2 predicate");
+            Assertions.assertTrue(plan.getScanNodes().stream().filter(scan -> scan instanceof HdfsScanNode)
+                    .map(scan -> (HdfsScanNode) scan).filter(scan -> scan.getTableName().equals("t1"))
+                    .flatMap(scan -> scan.getScanNodePredicates().getNonPartitionConjuncts().stream())
+                    .map(ExprToSql::toSql).anyMatch(predicate -> predicate.contains("c2") && predicate.contains("'x'")),
+                    "Refreshing the changed scan must preserve its executable row filter\n" + explain);
+            Assertions.assertEquals(0, unchangedLookups.get(),
+                    "Late predicate pushdown must not repeat partition metadata lookup for the unchanged part_tbl1 scan");
+        } finally {
+            try {
+                starRocksAssert.dropDatabase(DATABASE);
+            } finally {
+                connectContext.setDatabase(previousDatabase);
+                connectContext.setSessionVariable(previousSession);
+            }
+        }
     }
 
     private void assertExecutableHivePredicate(boolean multiStages) throws Exception {

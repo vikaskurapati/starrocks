@@ -39,6 +39,7 @@ import com.starrocks.sql.optimizer.operator.logical.LogicalTreeAnchorOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalViewScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalWindowOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalOlapScanOperator;
+import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rule.RuleSet;
 import com.starrocks.sql.optimizer.rule.ivm.IvmRewriter;
 import com.starrocks.sql.optimizer.rule.join.JoinReorderFactory;
@@ -158,7 +159,10 @@ import org.apache.commons.collections4.CollectionUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -839,8 +843,16 @@ public class QueryOptimizer extends Optimizer {
         rootTaskContext.setRequiredColumns(requiredColumns.clone());
         scheduler.rewriteOnce(tree, rootTaskContext, RuleSet.PRUNE_COLUMNS_RULES);
         scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
+        // Builders replace scan instances during pushdown. All column identities remain stable,
+        // so use them to recognize unchanged scans and retain their existing partition pruning.
+        Map<ColumnRefSet, ScalarOperator> scanPredicates = new HashMap<>();
+        for (var scan : MvUtils.getScanOperator(tree)) {
+            ScalarOperator predicate = scan.getPredicate();
+            scanPredicates.put(new ColumnRefSet(scan.getColumnMetaToColRefMap().values()),
+                    predicate == null ? null : predicate.clone());
+        }
         scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PUSH_DOWN_PREDICATE_RULES);
-        refreshPartitionPruningAfterPredicatePushdown(tree, rootTaskContext);
+        refreshPartitionPruningAfterPredicatePushdown(tree, rootTaskContext, scanPredicates);
         scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PRUNE_EMPTY_OPERATOR_RULES);
         rootTaskContext.setRequiredColumns(requiredColumns.clone());
         scheduler.rewriteOnce(tree, rootTaskContext, RuleSet.PRUNE_COLUMNS_RULES);
@@ -852,10 +864,23 @@ public class QueryOptimizer extends Optimizer {
 
     private void refreshPartitionPruningAfterPredicatePushdown(OptExpression tree,
                                                                TaskContext rootTaskContext) {
+        // UNION compensation can change partition coverage as well as predicates.
+        refreshPartitionPruningAfterPredicatePushdown(tree, rootTaskContext, null);
+    }
+
+    private void refreshPartitionPruningAfterPredicatePushdown(OptExpression tree,
+                                                               TaskContext rootTaskContext,
+                                                               Map<ColumnRefSet, ScalarOperator> previousPredicates) {
         // View plans and MV rewrites can push predicates into scans that were pruned earlier.
         // Reset the marker so external scans rebuild ScanOperatorPredicates from the new predicates;
         // the fragment builder consumes those classified predicates, not scan.getPredicate().
-        MvUtils.getScanOperator(tree).forEach(scan -> scan.resetOpRuleBit(OP_PARTITION_PRUNED));
+        for (var scan : MvUtils.getScanOperator(tree)) {
+            ColumnRefSet columns = new ColumnRefSet(scan.getColumnMetaToColRefMap().values());
+            if (previousPredicates == null || !previousPredicates.containsKey(columns)
+                    || !Objects.equals(previousPredicates.get(columns), scan.getPredicate())) {
+                scan.resetOpRuleBit(OP_PARTITION_PRUNED);
+            }
+        }
         scheduler.rewriteIterative(tree, rootTaskContext, RuleSet.PARTITION_PRUNE_RULES);
     }
 
