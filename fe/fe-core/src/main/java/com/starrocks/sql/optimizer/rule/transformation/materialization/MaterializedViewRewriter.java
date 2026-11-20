@@ -2274,6 +2274,10 @@ public class MaterializedViewRewriter implements IMaterializedViewRewriter {
         // don't reset selected partition ids for query input, because query's partition ranges should not be extended.
         OptExpression newQueryInput = duplicator.duplicate(queryInput, false);
         List<ColumnRefOperator> newQueryOutputColumns = duplicator.getMappedColumns(originalOutputColumns);
+        // RewriteTreeTask also visits scans below compensation Filters and Projects. A marker
+        // only on the branch root cannot stop a scan rule matched below those wrappers.
+        MvUtils.getScanOperator(newQueryInput).forEach(scan -> scan.setOpRuleBit(OP_MV_UNION_REWRITE));
+        MvUtils.getScanOperator(viewInput).forEach(scan -> scan.setOpRuleBit(OP_MV_UNION_REWRITE));
 
         // rewrite viewInput
         // for viewInput, there must be a projection,

@@ -73,6 +73,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static com.starrocks.sql.optimizer.operator.OpRuleBit.OP_MV_UNION_REWRITE;
+
 /**
  * Exercises the query branch of MV UNION compensation directly. Partial-refresh view candidates can
  * be rejected by the full planner before this call, so this test isolates the project-root contract
@@ -89,6 +91,11 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
     @Test
     public void testProjectedViewScanPreservesUnionCompensation() throws Exception {
         assertCompensationSurvivesPlanning(false, ProjectionKind.IDENTITY);
+    }
+
+    @Test
+    public void testUnionCompensatedViewBranchRejectsFurtherScanRewrite() throws Exception {
+        assertCompensationSurvivesPlanning(false, ProjectionKind.IDENTITY, true);
     }
 
     @Test
@@ -201,6 +208,11 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
     }
 
     private void assertCompensationSurvivesPlanning(boolean aggregate, ProjectionKind projectionKind) throws Exception {
+        assertCompensationSurvivesPlanning(aggregate, projectionKind, false);
+    }
+
+    private void assertCompensationSurvivesPlanning(boolean aggregate, ProjectionKind projectionKind,
+                                                  boolean checkUnionGuard) throws Exception {
         String previousDatabase = connectContext.getDatabase();
         SessionVariable previousSession = connectContext.getSessionVariable();
         SessionVariable session = (SessionVariable) previousSession.clone();
@@ -298,6 +310,24 @@ public class ViewUnionRewriteCompensationTest extends PlanTestNoneDBBase {
                             .containsAll(queryBranch.getOp().getPredicate().getUsedColumns()),
                     "The filter must reference the Project's output, before alias/expression substitution");
             InputDependenciesChecker.getInstance().validate(compensated, context.getTaskContext());
+
+            if (checkUnionGuard) {
+                // doUnionRewrite(RewriteContext, OptExpression) marks these two branch roots before
+                // delegating to the public UNION builder. Exercise that builder and its real duplicator.
+                compensated.getOp().setOpRuleBit(OP_MV_UNION_REWRITE);
+                OptExpression viewInput = MvUtils.cloneExpression(inlineView);
+                viewInput.getOp().setProjection(new Projection(Map.of(output, output)));
+                viewInput.getOp().setOpRuleBit(OP_MV_UNION_REWRITE);
+                OptExpression union = rewriter.doUnionRewrite(compensated, viewInput, rewriteContext);
+                context.getCandidateMvs().add(materialization);
+                var scans = MvUtils.getScanOperator(union.inputAt(0));
+                Assertions.assertFalse(scans.isEmpty());
+                for (var scan : scans) {
+                    Assertions.assertFalse(OnlyScanRule.getInstance().check(OptExpression.create(scan), context),
+                            "The recursive rewrite task must reject a scan below the marked compensation Filter");
+                }
+                return;
+            }
 
             // Run the ordinary optimizer on the returned query branch. The exclusion must survive
             // project merging and physical implementation, not merely exist on a logical project.
