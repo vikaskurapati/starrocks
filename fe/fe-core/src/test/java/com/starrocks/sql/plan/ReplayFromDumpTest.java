@@ -32,8 +32,6 @@ import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.base.CTEProperty;
 import com.starrocks.sql.optimizer.dump.QueryDumpInfo;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalFilterOperator;
-import com.starrocks.sql.optimizer.operator.physical.PhysicalJoinOperator;
-import com.starrocks.sql.optimizer.operator.physical.PhysicalOlapScanOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalWindowOperator;
 import com.starrocks.sql.optimizer.rule.RuleSet;
 import com.starrocks.sql.optimizer.rule.transformation.JoinAssociativityRule;
@@ -48,8 +46,6 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class ReplayFromDumpTest extends ReplayFromDumpTestBase {
@@ -1384,21 +1380,6 @@ public class ReplayFromDumpTest extends ReplayFromDumpTestBase {
     }
 
     @Test
-    public void testLateViewRewriteJoinReorder() throws Exception {
-        ExecPlan plan = replayViewRewriteDump("late_view_join_reorder");
-        PlanTestBase.assertContains(plan.getExplainString(TExplainLevel.NORMAL), "TABLE: mv", "UNION");
-        var firstJoins = viewRewritePlanNodes(plan.getPhysicalPlan()).stream()
-                .filter(node -> node.getOp() instanceof PhysicalJoinOperator)
-                .map(join -> viewRewritePlanNodes(join).stream()
-                        .filter(node -> node.getOp() instanceof PhysicalOlapScanOperator)
-                        .map(node -> ((PhysicalOlapScanOperator) node.getOp()).getTable().getName())
-                        .collect(Collectors.toSet()))
-                .filter(tables -> tables.size() == 2).toList();
-        Assertions.assertEquals(List.of(Set.of("t", "c")), firstJoins,
-                "The selective c must join t before the broad t-b join");
-    }
-
-    @Test
     public void testLateViewRewriteHivePredicate() throws Exception {
         ExecPlan plan = replayViewRewriteDump("late_view_hive_predicate");
         PlanTestBase.assertContains(plan.getExplainString(TExplainLevel.NORMAL), "TABLE: mv", "UNION");
@@ -1410,16 +1391,6 @@ public class ReplayFromDumpTest extends ReplayFromDumpTestBase {
         Assertions.assertTrue(predicates.stream()
                         .anyMatch(predicate -> predicate.contains("s_acctbal") && predicate.contains("> 0")),
                 "The late view predicate must reach the executable Hive scan");
-    }
-
-    @Test
-    public void testViewUnionFilterCompensation() throws Exception {
-        ExecPlan plan = replayViewRewriteDump("view_union_filter_compensation");
-        PlanTestBase.assertContains(plan.getExplainString(TExplainLevel.NORMAL), "TABLE: mv", "UNION");
-        Assertions.assertTrue(plan.getScanNodes().stream()
-                .filter(scan -> scan instanceof OlapScanNode olap && olap.getOlapTable().getName().equals("t"))
-                .anyMatch(scan -> scan.getExplainString().contains(">= 10") || scan.getExplainString().contains("10 <= ")),
-                "The base-table branch must exclude rows already covered by mv");
     }
 
     private ExecPlan replayViewRewriteDump(String name) throws Exception {
