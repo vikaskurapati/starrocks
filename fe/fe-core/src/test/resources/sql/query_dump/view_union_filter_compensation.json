@@ -51,7 +51,7 @@
       }
     }
   },
-  "session_variables": "{\"enable_materialized_view_rewrite\":true,\"enable_view_based_mv_rewrite\":true,\"enable_force_rule_based_mv_rewrite\":true,\"enable_materialized_view_union_rewrite\":true}",
+  "session_variables": "{\"enable_materialized_view_rewrite\":true,\"enable_view_based_mv_rewrite\":true,\"enable_force_rule_based_mv_rewrite\":true,\"enable_materialized_view_union_rewrite\":true,\"materialized_view_rewrite_mode\":\"force\",\"enable_materialized_view_text_match_rewrite\":false}",
   "be_number": 1,
   "be_core_stat": {
     "numOfHardwareCoresPerBe": "{}",

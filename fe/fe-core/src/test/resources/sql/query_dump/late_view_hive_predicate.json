@@ -1,0 +1,108 @@
+{
+  "statement": "SELECT id FROM default_catalog.late_view_hive_predicate_repro.v UNION ALL SELECT id FROM default_catalog.late_view_hive_predicate_repro.v WHERE source > 0",
+  "table_meta": {
+    "tpch.supplier": "CREATE EXTERNAL TABLE `supplier` (\n  `s_suppkey` int(11) NULL COMMENT \"null\",\n  `s_name` varchar(1073741824) NULL COMMENT \"null\",\n  `s_address` varchar(1073741824) NULL COMMENT \"null\",\n  `s_nationkey` int(11) NULL COMMENT \"null\",\n  `s_phone` varchar(1073741824) NULL COMMENT \"null\",\n  `s_acctbal` decimal(15, 2) NULL COMMENT \"null\",\n  `s_comment` varchar(1073741824) NULL COMMENT \"null\"\n) ENGINE=HIVE \nPROPERTIES (\n\"database\" = \"tpch\",\n\"table\" = \"supplier\",\n\"resource\" = \"hive0\",\n\"hive.table.input.format\"  =  \"org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat\",\n\"hive.table.column.names\"  =  \"s_suppkey,s_name,s_address,s_nationkey,s_phone,s_acctbal,s_comment\",\n\"hive.table.column.types\"  =  \"int#string#string#int#string#decimal(15,2)#string\"\n);",
+    "tpch.nation": "CREATE EXTERNAL TABLE `nation` (\n  `n_nationkey` int(11) NULL COMMENT \"null\",\n  `n_name` varchar(1073741824) NULL COMMENT \"null\",\n  `n_regionkey` int(11) NULL COMMENT \"null\",\n  `n_comment` varchar(1073741824) NULL COMMENT \"null\"\n) ENGINE=HIVE \nPROPERTIES (\n\"database\" = \"tpch\",\n\"table\" = \"nation\",\n\"resource\" = \"hive0\",\n\"hive.table.input.format\"  =  \"org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat\",\n\"hive.table.column.names\"  =  \"n_nationkey,n_name,n_regionkey,n_comment\",\n\"hive.table.column.types\"  =  \"int#string#int#string\"\n);",
+    "late_view_hive_predicate_repro.mv": "CREATE MATERIALIZED VIEW `mv` (`id`)\nDISTRIBUTED BY HASH(`id`) BUCKETS 1 \nREFRESH DEFERRED MANUAL\nPROPERTIES (\n\"replicated_storage\" = \"true\",\n\"query_rewrite_consistency\" = \"FORCE_MV\",\n\"replication_num\" = \"1\",\n\"storage_medium\" = \"HDD\"\n)\nAS SELECT id FROM v;"
+  },
+  "external_table_catalog": {
+    "tpch.supplier": "hive0",
+    "tpch.nation": "hive0"
+  },
+  "external_table_row_count": {
+    "tpch.supplier": 1000000,
+    "tpch.nation": 25
+  },
+  "hms_table": {
+    "hive0%tpch%nation": [
+      {
+        "type": "hive"
+      },
+      "{\"OutputRowCount\":\"0.0\",\"PartitionColumns\":[],\"DataColumns\":[\"n_nationkey\",\"n_name\",\"n_regionkey\",\"n_comment\"],\"PartitionNames\":[]}"
+    ],
+    "hive0%tpch%supplier": [
+      {
+        "type": "hive"
+      },
+      "{\"OutputRowCount\":\"0.0\",\"PartitionColumns\":[],\"DataColumns\":[\"s_suppkey\",\"s_name\",\"s_address\",\"s_nationkey\",\"s_phone\",\"s_acctbal\",\"s_comment\"],\"PartitionNames\":[]}"
+    ]
+  },
+  "table_row_count": {
+    "late_view_hive_predicate_repro.mv": {
+      "mv": 0
+    }
+  },
+  "view_meta": {
+    "late_view_hive_predicate_repro.v": "SELECT `hive0`.`tpch`.`s`.`s_suppkey` AS `id`, `hive0`.`tpch`.`s`.`s_acctbal` AS `source`\nFROM `hive0`.`tpch`.`supplier` AS `s` INNER JOIN `hive0`.`tpch`.`nation` AS `n` ON `hive0`.`tpch`.`s`.`s_nationkey` = `hive0`.`tpch`.`n`.`n_nationkey`"
+  },
+  "column_statistics": {
+    "tpch.nation": {
+      "n_nationkey": {
+        "version": 1,
+        "min": "0.0",
+        "max": "24.0",
+        "nullsFraction": "0.0",
+        "averageRowSize": "4.0",
+        "distinctValuesCount": "25.0",
+        "collectionSize": "-1.0",
+        "type": "ESTIMATE"
+      }
+    },
+    "late_view_hive_predicate_repro.mv": {
+      "id": {
+        "version": 1,
+        "min": "-Infinity",
+        "max": "Infinity",
+        "nullsFraction": "0.0",
+        "averageRowSize": "1.0",
+        "distinctValuesCount": "1.0",
+        "collectionSize": "-1.0",
+        "type": "UNKNOWN"
+      }
+    },
+    "tpch.supplier": {
+      "s_nationkey": {
+        "version": 1,
+        "min": "0.0",
+        "max": "24.0",
+        "nullsFraction": "0.0",
+        "averageRowSize": "4.0",
+        "distinctValuesCount": "25.0",
+        "collectionSize": "-1.0",
+        "type": "ESTIMATE"
+      },
+      "s_acctbal": {
+        "version": 1,
+        "min": "-998.22",
+        "max": "9999.72",
+        "nullsFraction": "0.0",
+        "averageRowSize": "8.0",
+        "distinctValuesCount": "656145.0",
+        "collectionSize": "-1.0",
+        "type": "ESTIMATE"
+      },
+      "s_suppkey": {
+        "version": 1,
+        "min": "1.0",
+        "max": "1000000.0",
+        "nullsFraction": "0.0",
+        "averageRowSize": "4.0",
+        "distinctValuesCount": "1000000.0",
+        "collectionSize": "-1.0",
+        "type": "ESTIMATE"
+      }
+    }
+  },
+  "session_variables": "{\"enable_materialized_view_rewrite\":true,\"enable_view_based_mv_rewrite\":true,\"enable_materialized_view_multi_stages_rewrite\":false,\"enable_cbo_based_mv_rewrite\":false,\"enable_cbo_view_based_mv_rewrite\":false,\"materialized_view_rewrite_mode\":\"default\",\"enable_force_rule_based_mv_rewrite\":true,\"enable_materialized_view_union_rewrite\":false,\"enable_materialized_view_text_match_rewrite\":false,\"cboPushDownAggregateMode_v1\":-1,\"enable_global_late_materialization\":false,\"optimizer_materialized_view_timelimit\":120000,\"new_planner_optimize_timeout\":120000}",
+  "be_number": 1,
+  "be_core_stat": {
+    "cachedAvgNumOfHardwareCores": -1,
+    "numOfHardwareCoresPerBe": "{}"
+  },
+  "be_core_stat_v2": {
+    "cachedAvgNumOfHardwareCores": -1,
+    "warehouses": [],
+    "currentWarehouseId": 0
+  },
+  "exception": []
+}

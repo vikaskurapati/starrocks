@@ -36,6 +36,7 @@
       }
     }
   },
+  "session_variables": "{\"cbo_cte_reuse_rate_v2\":0}",
   "be_number": 1,
   "be_core_stat": {
     "numOfHardwareCoresPerBe": "{}",

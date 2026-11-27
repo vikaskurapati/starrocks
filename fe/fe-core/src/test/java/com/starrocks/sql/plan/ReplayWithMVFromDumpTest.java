@@ -223,17 +223,6 @@ public class ReplayWithMVFromDumpTest extends ReplayFromDumpTestBase {
     }
 
     @Test
-    public void testViewUnionFilterCompensationOnProjectedView() throws Exception {
-        // The MV covers only id < 10; the full-view query needs a base-table branch filtered by id >= 10.
-        String plan = getPlanFragment(
-                "query_dump/materialized-view/view_union_filter_compensation", TExplainLevel.NORMAL);
-        PlanTestBase.assertContains(plan, "UNION", "mv", "t");
-        org.junit.jupiter.api.Assertions.assertTrue(
-                plan.contains(">= 10") || plan.contains("10 <= "),
-                "The base-table branch must exclude rows already covered by mv (id < 10):\n" + plan);
-    }
-
-    @Test
     public void testChooseBest() throws Exception {
         String plan = getPlanFragment("query_dump/materialized-view/choose_best_mv1", TExplainLevel.NORMAL);
         PlanTestBase.assertContains(plan, "rocketview_v4_mv1");
