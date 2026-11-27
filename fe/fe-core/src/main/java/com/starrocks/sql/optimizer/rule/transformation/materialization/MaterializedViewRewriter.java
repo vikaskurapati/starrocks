@@ -64,6 +64,7 @@ import com.starrocks.sql.optimizer.operator.logical.LogicalFilterOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalJoinOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalOlapScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalProjectOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalUnionOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalViewScanOperator;
@@ -2078,6 +2079,20 @@ public class MaterializedViewRewriter implements IMaterializedViewRewriter {
     private OptExpression pushdownPredicatesForJoin(OptExpression optExpression, ScalarOperator predicate) {
         if (!(optExpression.getOp() instanceof LogicalJoinOperator)) {
             if (predicate != null) {
+                if (!(optExpression.getOp() instanceof LogicalScanOperator)) {
+                    // Pruning and implementation rules preserve explicit Filters for every operator.
+                    // Compensation was mapped through an attached projection in doQueryBasedRewrite,
+                    // so place it below that projection where its input columns are still available.
+                    Projection projection = optExpression.getOp().getProjection();
+                    if (projection != null) {
+                        Operator.Builder builder = OperatorBuilderFactory.build(optExpression.getOp());
+                        builder.withOperator(optExpression.getOp()).setProjection(null);
+                        OptExpression input = OptExpression.create(builder.build(), optExpression.getInputs());
+                        OptExpression filter = OptExpression.create(new LogicalFilterOperator(predicate), input);
+                        return OptExpression.create(new LogicalProjectOperator(projection.getColumnRefMap()), filter);
+                    }
+                    return OptExpression.create(new LogicalFilterOperator(predicate), optExpression);
+                }
                 // predicate cannot be pushdown, we should add it optExpression
                 Operator.Builder builder = OperatorBuilderFactory.build(optExpression.getOp());
                 builder.withOperator(optExpression.getOp());
@@ -2268,6 +2283,10 @@ public class MaterializedViewRewriter implements IMaterializedViewRewriter {
         // don't reset selected partition ids for query input, because query's partition ranges should not be extended.
         OptExpression newQueryInput = duplicator.duplicate(queryInput, false);
         List<ColumnRefOperator> newQueryOutputColumns = duplicator.getMappedColumns(originalOutputColumns);
+        // RewriteTreeTask also visits scans below compensation Filters and Projects. A marker
+        // only on the branch root cannot stop a scan rule matched below those wrappers.
+        MvUtils.getScanOperator(newQueryInput).forEach(scan -> scan.setOpRuleBit(OP_MV_UNION_REWRITE));
+        MvUtils.getScanOperator(viewInput).forEach(scan -> scan.setOpRuleBit(OP_MV_UNION_REWRITE));
 
         // rewrite viewInput
         // for viewInput, there must be a projection,

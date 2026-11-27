@@ -20,15 +20,22 @@ import com.starrocks.catalog.Table;
 import com.starrocks.common.Pair;
 import com.starrocks.schema.MTable;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.expression.BinaryType;
 import com.starrocks.sql.optimizer.OptExpression;
+import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalScanOperator;
+import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
+import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.plan.PlanTestBase;
+import com.starrocks.thrift.TExplainLevel;
+import com.starrocks.utframe.UtFrameUtils;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer.MethodName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -182,26 +189,24 @@ public class MvRewriteUnionTest extends MVTestBase {
         String query2 = "select emps2.empid, emps2.salary, d1.deptno, d1.name name1, d2.name name2" +
                 " from emps2 join depts2 d1 on emps2.deptno = d1.deptno" +
                 " join depts2 d2 on emps2.deptno = d2.deptno where d1.deptno < 120";
-        String plan2 = getFragmentPlan(query2);
+        var execPlan = UtFrameUtils.getFragmentPlanWithTrace(connectContext, query2, "MV").second.first;
+        String plan2 = execPlan.getExplainString(TExplainLevel.NORMAL);
         PlanTestBase.assertContains(plan2, "join_union_mv_1");
-        PlanTestBase.assertContains(plan2, "  4:HASH JOIN\n" +
-                "  |  join op: INNER JOIN (BUCKET_SHUFFLE)\n" +
-                "  |  colocate: false, reason: \n" +
-                "  |  equal join conjunct: 18: deptno = 15: deptno\n" +
-                "  |  other predicates: 15: deptno >= 100");
-        PlanTestBase.assertContainsIgnoreColRefs(plan2, "2:OlapScanNode\n" +
-                "     TABLE: emps2\n" +
-                "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: 15: deptno >= 100, 15: deptno < 120\n" +
-                "     partitions=1/1");
-        PlanTestBase.assertContainsIgnoreColRefs(plan2, "1:OlapScanNode\n" +
-                "     TABLE: depts2\n" +
-                "     PREAGGREGATION: ON\n" +
-                "     PREDICATES: 18: deptno < 120, 18: deptno >= 100");
-        PlanTestBase.assertContainsIgnoreColRefs(plan2, "  |----5:OlapScanNode\n" +
-                "  |       TABLE: depts2\n" +
-                "  |       PREAGGREGATION: ON\n" +
-                "  |       PREDICATES: 20: deptno >= 100, 20: deptno < 120");
+        PlanTestBase.assertContains(plan2, "join op: INNER JOIN (BUCKET_SHUFFLE)");
+        // Explicit compensation Filters can push the exclusion all the way to the scans.
+        // Verify coverage rather than requiring an additional redundant predicate on a numbered join.
+        var scans = new ArrayList<>(getScanOperators(execPlan.getPhysicalPlan(), "emps2"));
+        scans.addAll(getScanOperators(execPlan.getPhysicalPlan(), "depts2"));
+        Assertions.assertEquals(3, scans.size(), plan2);
+        for (var scan : scans) {
+            var predicates = Utils.extractConjuncts(scan.getPredicate());
+            Assertions.assertTrue(predicates.stream().anyMatch(predicate -> predicate instanceof BinaryPredicateOperator binary
+                    && binary.getBinaryType() == BinaryType.GE
+                    && binary.getChild(1).equals(ConstantOperator.createInt(100))), plan2);
+            Assertions.assertTrue(predicates.stream().anyMatch(predicate -> predicate instanceof BinaryPredicateOperator binary
+                    && binary.getBinaryType() == BinaryType.LT
+                    && binary.getChild(1).equals(ConstantOperator.createInt(120))), plan2);
+        }
     }
 
     @Test

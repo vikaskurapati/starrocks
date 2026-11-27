@@ -18,15 +18,21 @@ import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.Pair;
 import com.starrocks.common.profile.Tracers;
+import com.starrocks.planner.HdfsScanNode;
+import com.starrocks.planner.OlapScanNode;
+import com.starrocks.planner.SelectNode;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.expression.ExprToSql;
 import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptimizerContext;
 import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.base.CTEProperty;
 import com.starrocks.sql.optimizer.dump.QueryDumpInfo;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalFilterOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalWindowOperator;
 import com.starrocks.sql.optimizer.rule.RuleSet;
 import com.starrocks.sql.optimizer.rule.transformation.JoinAssociativityRule;
 import com.starrocks.thrift.TExplainLevel;
@@ -38,6 +44,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.stream.Stream;
 
 public class ReplayFromDumpTest extends ReplayFromDumpTestBase {
@@ -1327,6 +1335,76 @@ public class ReplayFromDumpTest extends ReplayFromDumpTestBase {
                         TExplainLevel.NORMAL);
         PlanTestBase.assertContains(replayPair.second, "5:OlapScanNode\n" +
                 "     TABLE: tbl_5");
+    }
+
+    @Test
+    public void testUnionPredicateColumnPruning() throws Exception {
+        ExecPlan execPlan = replayViewRewriteDump("union_predicate_column_pruning");
+        PlanTestBase.assertContains(execPlan.getExplainString(TExplainLevel.NORMAL),
+                "MultiCastDataSinks", "TABLE: mv", "UNION");
+        Assertions.assertEquals(1, execPlan.getOutputExprs().size());
+        var scans = execPlan.getScanNodes().stream()
+                .filter(scan -> scan instanceof OlapScanNode olap && olap.getOlapTable().getName().equals("t"))
+                .toList();
+        Assertions.assertEquals(2, scans.size());
+        for (var scan : scans) {
+            PlanTestBase.assertContains(scan.getExplainString(), ": source,", "] = 1");
+        }
+    }
+
+    @Test
+    public void testWindowPredicateColumnPruning() throws Exception {
+        ExecPlan execPlan = replayViewRewriteDump("window_predicate_column_pruning");
+        PlanTestBase.assertContains(execPlan.getExplainString(TExplainLevel.NORMAL),
+                "MultiCastDataSinks", "TABLE: mv_window", "UNION", "ANALYTIC");
+        Assertions.assertEquals(1, execPlan.getOutputExprs().size());
+
+        var scans = execPlan.getScanNodes().stream()
+                .filter(scan -> scan instanceof OlapScanNode olap && olap.getOlapTable().getName().equals("t"))
+                .toList();
+        Assertions.assertTrue(scans.stream().allMatch(scan -> scan.getConjuncts().isEmpty()),
+                "Filtering source at the scan would change ROW_NUMBER over the unpartitioned input");
+        var filters = execPlan.getFragments().stream()
+                .flatMap(fragment -> fragment.collectNodes().stream())
+                .filter(node -> node instanceof SelectNode)
+                .toList();
+        Assertions.assertEquals(1, filters.size());
+        PlanTestBase.assertContains(filters.get(0).getExplainString(), "source", "= 1");
+        OptExpression sourceFilter = viewRewritePlanNodes(execPlan.getPhysicalPlan()).stream()
+                .filter(node -> node.getOp() instanceof PhysicalFilterOperator
+                        && node.getOp().getPredicate().toString().contains("source"))
+                .findFirst().orElseThrow();
+        Assertions.assertTrue(viewRewritePlanNodes(sourceFilter).stream()
+                        .anyMatch(node -> node.getOp() instanceof PhysicalWindowOperator),
+                "The source filter must be evaluated after ROW_NUMBER");
+    }
+
+    @Test
+    public void testLateViewRewriteHivePredicate() throws Exception {
+        ExecPlan plan = replayViewRewriteDump("late_view_hive_predicate");
+        PlanTestBase.assertContains(plan.getExplainString(TExplainLevel.NORMAL), "TABLE: mv", "UNION");
+        var predicates = plan.getScanNodes().stream()
+                .filter(scan -> scan instanceof HdfsScanNode hive && hive.getTableName().equals("supplier"))
+                .map(scan -> (HdfsScanNode) scan)
+                .flatMap(scan -> scan.getScanNodePredicates().getNonPartitionConjuncts().stream())
+                .map(ExprToSql::toSql).toList();
+        Assertions.assertTrue(predicates.stream()
+                        .anyMatch(predicate -> predicate.contains("s_acctbal") && predicate.contains("> 0")),
+                "The late view predicate must reach the executable Hive scan");
+    }
+
+    private ExecPlan replayViewRewriteDump(String name) throws Exception {
+        QueryDumpInfo dump = getDumpInfoFromJson(getDumpInfoFromFile("query_dump/" + name));
+        // Preserve the dump's aggregate-pushdown setting; getPlanFragment() overrides it.
+        return UtFrameUtils.getNewPlanAndFragmentFromDump(connectContext, dump).second;
+    }
+
+    private static List<OptExpression> viewRewritePlanNodes(OptExpression root) {
+        var nodes = new ArrayList<>(List.of(root));
+        for (int i = 0; i < nodes.size(); i++) {
+            nodes.addAll(nodes.get(i).getInputs());
+        }
+        return nodes;
     }
 
     @Test
